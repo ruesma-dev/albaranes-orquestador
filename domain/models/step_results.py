@@ -1,44 +1,51 @@
 # domain/models/step_results.py
-"""DTOs que devuelven los clientes HTTP a los workers (sv2, sv3, sv6).
-
-Aislan al motor de los detalles de cada API: el motor solo ve
-ExtractResult / PersistResult / ValuationResult con campos planos.
-"""
+"""DTOs que devuelven los clientes HTTP a los workers (sv2, sv3, sv6)."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
 @dataclass(frozen=True)
 class ExtractResult:
-    """Lo que devuelve sv2 /v1/albaranes/extract.
+    """Lo que devuelve sv2 /v1/albaranes/extract/phase-1.
 
-    Conservamos el envelope completo (raw_envelope) porque sv3 lo
-    necesita íntegro al persistir; ``confidence_pct`` y ``providers_used``
-    son convenientes para logging/auditoría.
+    El envelope tiene la forma:
+        { "meta": {...}, "data": {...DocumentoAlbaran...}, "debug": {...} }
+    Conservamos el envelope completo (raw_envelope) porque sv7 lo
+    necesita íntegro para pasarlo a fase 2 y luego a sv3.
     """
-
     raw_envelope: dict[str, Any]
-    providers_used: list[str]
+    provider_used: str
     confidence_pct: float | None
 
 
 @dataclass(frozen=True)
-class PersistResult:
-    """Lo que devuelve sv3 /v1/albaranes/persist.
+class ReviewResult:
+    """Lo que devuelve sv2 /v1/albaranes/extract/phase-2.
 
-    - ``duplicate``: True si sv3 detectó un fichero ya persistido por
-      sha256. En tal caso, ``document_id`` referencia al existente.
-    - ``selected_contrato_codigo``: None si 0 ó >1 contratos sin elegir.
-    - ``has_existing_valuation`` y ``existing_valuation_status``: solo
-      tienen valor cuando es duplicado y permitimos al motor decidir
-      a qué estado saltar (regla del cliente: si ya existe, no lo baja
-      y pasa al siguiente paso).
-    - ``existing_workflow_state_hint``: si el motor consulta sv7 para
-      saber si hay workflow ya cerrado para ese document_id, lo trae
-      aquí — pero esa consulta la hace el orquestador, no sv3.
+    El envelope tiene la forma:
+        { "meta": {...}, "data": {...RevisionAlbaranFase2...}, "debug": {...} }
+
+    El campo ``data`` contiene:
+        - review_status: 'ok' | 'ok_with_changes' | 'inconsistent'
+        - explicacion_global: str | None
+        - cambios: list[CambioPropuesto]
+
+    sv7 no aplica el patch aquí: lo aplica en una utilidad
+    `apply_patch_to_envelope` cuando va a hacer el merge entre fase 1
+    y fase 2 para mandárselo a sv3.
     """
+    raw_envelope: dict[str, Any]
+    provider_used: str
+    review_status: str
+    explicacion_global: str | None
+    changes_count: int
+
+
+@dataclass(frozen=True)
+class PersistResult:
+    """Lo que devuelve sv3 /v1/albaranes/persist."""
 
     document_id: str
     duplicate: bool
@@ -50,13 +57,7 @@ class PersistResult:
 
 @dataclass(frozen=True)
 class ValuationResult:
-    """Lo que devuelve sv6 /v1/valuation/run o /re-run.
-
-    ``status`` puede ser 'ok' (valoración generada) o 'no_contract'
-    (sv6 marca cabecera vacía y no llama a IA). En caso 'no_contract'
-    el motor lo trata como valuation_failed para que el revisor
-    intervenga.
-    """
+    """Lo que devuelve sv6 /v1/valuation/run o /re-run."""
 
     valuation_id: str
     status: str  # 'ok' | 'no_contract' | otros

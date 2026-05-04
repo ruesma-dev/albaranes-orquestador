@@ -1,7 +1,7 @@
 # domain/models/workflow.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
@@ -11,7 +11,8 @@ class WorkflowState(str, Enum):
 
     Activos (orquestador trabajando):
       - email_received        — recién creado, transita inmediato a extracting
-      - extracting            — llamada a sv2 en curso
+      - extracting            — llamada a sv2 fase 1 en curso
+      - reviewing             — llamada a sv2 fase 2 en curso (NUEVO)
       - persisting            — llamada a sv3 en curso
       - valuing               — llamada a sv6 en curso
 
@@ -25,12 +26,14 @@ class WorkflowState(str, Enum):
 
     Terminales con fallo (retryable, manual o auto):
       - extraction_failed
+      - review_failed         (NUEVO — fase 2 inutilizable)
       - persistence_failed
       - valuation_failed
     """
 
     EMAIL_RECEIVED = "email_received"
     EXTRACTING = "extracting"
+    REVIEWING = "reviewing"
     PERSISTING = "persisting"
     AWAITING_CONTRACT_SELECTION = "awaiting_contract_selection"
     VALUING = "valuing"
@@ -38,6 +41,7 @@ class WorkflowState(str, Enum):
     APPROVED = "approved"
     COMPLETED_DUPLICATE = "completed_duplicate"
     EXTRACTION_FAILED = "extraction_failed"
+    REVIEW_FAILED = "review_failed"
     PERSISTENCE_FAILED = "persistence_failed"
     VALUATION_FAILED = "valuation_failed"
 
@@ -48,6 +52,7 @@ class WorkflowState(str, Enum):
 ACTIVE_STATES = frozenset({
     WorkflowState.EMAIL_RECEIVED,
     WorkflowState.EXTRACTING,
+    WorkflowState.REVIEWING,
     WorkflowState.PERSISTING,
     WorkflowState.VALUING,
 })
@@ -67,6 +72,7 @@ TERMINAL_OK_STATES = frozenset({
 # Estados terminales con fallo (retryable).
 FAILED_STATES = frozenset({
     WorkflowState.EXTRACTION_FAILED,
+    WorkflowState.REVIEW_FAILED,
     WorkflowState.PERSISTENCE_FAILED,
     WorkflowState.VALUATION_FAILED,
 })
@@ -77,6 +83,7 @@ TERMINAL_STATES = TERMINAL_OK_STATES | FAILED_STATES
 # Mapa de qué estado activo retoma el retrier dado un estado fallido.
 RETRY_TARGET_STATE: dict[WorkflowState, WorkflowState] = {
     WorkflowState.EXTRACTION_FAILED: WorkflowState.EXTRACTING,
+    WorkflowState.REVIEW_FAILED: WorkflowState.REVIEWING,
     WorkflowState.PERSISTENCE_FAILED: WorkflowState.PERSISTING,
     WorkflowState.VALUATION_FAILED: WorkflowState.VALUING,
 }

@@ -16,19 +16,27 @@ LogFormat = Literal["text", "json"]
 class Settings(BaseSettings):
     """Configuración del servicio 7 (orchestrator-api).
 
-    Coordina sv2 (extractor), sv3 (persister) y sv6 (valuation) según
-    una state machine persistida en BBDD compartida. No persiste datos
-    de albarán/contrato — solo metadatos del workflow.
+    CAMBIOS RESPECTO A LA VERSIÓN ANTERIOR (DOS FASES):
+      - SV2_PATH_EXTRACT renombrado a SV2_PATH_EXTRACT_PHASE_1.
+      - Nuevo SV2_PATH_EXTRACT_PHASE_2 + SV2_REVIEW_TIMEOUT_S.
+      - Nuevo flag APPLY_PHASE_2_PATCH (default true) — controla si los
+        cambios propuestos por la fase 2 se APLICAN sobre el JSON de
+        fase 1 antes de mandarlo a sv3.
+        - true  → sv7 fusiona fase 1 + patch fase 2 → sv3 persiste el
+                  resultado fusionado. Las líneas modificadas quedan
+                  marcadas con source_phase='phase_2'.
+        - false → sv7 manda a sv3 el JSON de fase 1 SIN modificar.
+                  Pero igual incluye en el envelope el bloque
+                  review_phase2_metadata para que sv3 lo persista
+                  como AUDITORÍA en las columnas review_phase2_* de
+                  albaran_documents_merge. source_phase queda 'phase_1'
+                  en todas las líneas. Útil para shadow-mode: dejas
+                  fase 2 corriendo y la observas sin que afecte a la
+                  BBDD principal.
     """
 
     # ------------------------------------------------------------ #
-    # BBDD compartida (mismas credenciales que sv3/sv4/sv5/sv6).
-    # sv7 escribe en sus 2 tablas (workflow_runs, workflow_step_history).
-    #
-    # AUTO-CREATE: igual que sv3/sv4, sv7 se conecta primero como
-    # admin (PG_ADMIN_*) y, si AUTO_CREATE_DATABASE=true y la BBDD
-    # ``albaranes`` no existe, la crea. Después se reconecta a la
-    # BBDD recién creada y aplica el DDL idempotente de sus tablas.
+    # BBDD compartida.
     # ------------------------------------------------------------ #
     pg_host: str = Field("localhost", alias="PG_HOST")
     pg_port: int = Field(5432, alias="PG_PORT")
@@ -42,19 +50,49 @@ class Settings(BaseSettings):
     auto_create_database: bool = Field(True, alias="AUTO_CREATE_DATABASE")
 
     # ------------------------------------------------------------ #
-    # Clientes HTTP a otros servicios.
-    # Timeouts pensados para los peores casos:
-    #   sv2: 180s (extractor multi-LLM con PDFs grandes).
-    #   sv3: 120s (persist + enrich + SharePoint upload).
-    #   sv6: 300s (valoración IA con PDF de contrato).
+    # sv2 — extractor (fase 1) y reviewer (fase 2).
     # ------------------------------------------------------------ #
     sv2_base_url: str = Field("http://127.0.0.1:8000", alias="SV2_BASE_URL")
+
     sv2_timeout_s: float = Field(180.0, alias="SV2_TIMEOUT_S")
-    sv2_path_extract: str = Field(
-        "/v1/albaranes/extract",
-        alias="SV2_PATH_EXTRACT",
+    sv2_path_extract_phase_1: str = Field(
+        "/v1/albaranes/extract/phase-1",
+        alias="SV2_PATH_EXTRACT_PHASE_1",
     )
 
+    sv2_review_timeout_s: float = Field(
+        180.0,
+        alias="SV2_REVIEW_TIMEOUT_S",
+        description="Timeout para fase 2.",
+    )
+    sv2_path_extract_phase_2: str = Field(
+        "/v1/albaranes/extract/phase-2",
+        alias="SV2_PATH_EXTRACT_PHASE_2",
+    )
+
+    # ------------------------------------------------------------ #
+    # FLAG DE MERGE FASE 1 + FASE 2.
+    #
+    # Default true (comportamiento "natural" de fase 2: aplicar los
+    # cambios). Pon a false para shadow-mode: ejecuta fase 2 igualmente
+    # y guarda los cambios propuestos como auditoría, pero NO modifica
+    # los datos persistidos.
+    # ------------------------------------------------------------ #
+    apply_phase_2_patch: bool = Field(
+        True,
+        alias="APPLY_PHASE_2_PATCH",
+        description=(
+            "Si true, sv7 aplica el patch propuesto por fase 2 sobre el "
+            "JSON de fase 1 antes de enviarlo a sv3 (líneas tocadas se "
+            "marcan source_phase='phase_2'). Si false, manda fase 1 sin "
+            "modificar pero conserva los cambios propuestos como auditoría "
+            "en review_phase2_payload_json."
+        ),
+    )
+
+    # ------------------------------------------------------------ #
+    # sv3 — persister.
+    # ------------------------------------------------------------ #
     sv3_base_url: str = Field("http://127.0.0.1:8001", alias="SV3_BASE_URL")
     sv3_timeout_s: float = Field(120.0, alias="SV3_TIMEOUT_S")
     sv3_path_persist: str = Field(
@@ -62,6 +100,9 @@ class Settings(BaseSettings):
         alias="SV3_PATH_PERSIST",
     )
 
+    # ------------------------------------------------------------ #
+    # sv6 — valuation.
+    # ------------------------------------------------------------ #
     sv6_base_url: str = Field("http://127.0.0.1:8003", alias="SV6_BASE_URL")
     sv6_timeout_s: float = Field(300.0, alias="SV6_TIMEOUT_S")
     sv6_path_run: str = Field("/v1/valuation/run", alias="SV6_PATH_RUN")
@@ -71,52 +112,29 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------ #
-    # Política de reintentos a nivel HTTP (cada llamada a
-    # sv2/sv3/sv6 reintenta hasta http_max_retries veces antes de
-    # marcar el step como FAILED).
+    # Política de reintentos HTTP.
     # ------------------------------------------------------------ #
     http_max_retries: int = Field(3, alias="HTTP_MAX_RETRIES")
     http_backoff_base_s: float = Field(2.0, alias="HTTP_BACKOFF_BASE_S")
     http_backoff_cap_s: float = Field(30.0, alias="HTTP_BACKOFF_CAP_S")
 
     # ------------------------------------------------------------ #
-    # Reintentos automáticos de workflows en estado *_failed.
+    # Auto-retry de workflows en *_failed.
     # ------------------------------------------------------------ #
-    workflow_max_auto_retries: int = Field(
-        3,
-        alias="WORKFLOW_MAX_AUTO_RETRIES",
-    )
-    workflow_retrier_interval_s: int = Field(
-        60,
-        alias="WORKFLOW_RETRIER_INTERVAL_S",
-        description="Cada cuántos segundos corre el job de reintentos.",
-    )
-    workflow_retrier_min_age_s: int = Field(
-        120,
-        alias="WORKFLOW_RETRIER_MIN_AGE_S",
-        description=(
-            "Edad mínima (segundos desde updated_at_utc) de un *_failed "
-            "antes de que el retrier lo reabra. Evita reintentar inmediato."
-        ),
-    )
+    workflow_max_auto_retries: int = Field(3, alias="WORKFLOW_MAX_AUTO_RETRIES")
+    workflow_retrier_interval_s: int = Field(60, alias="WORKFLOW_RETRIER_INTERVAL_S")
+    workflow_retrier_min_age_s: int = Field(120, alias="WORKFLOW_RETRIER_MIN_AGE_S")
 
     # ------------------------------------------------------------ #
-    # Working dir para guardar adjuntos temporalmente entre el evento
-    # email-received (multipart) y la llamada a sv2/sv3 en el
-    # BackgroundTask. Se limpia al terminar el workflow.
+    # tmpdir + API + logging.
     # ------------------------------------------------------------ #
     tmpdir_path: str = Field("/tmp/sv7", alias="TMPDIR_PATH")
-
-    # ------------------------------------------------------------ #
-    # API
-    # ------------------------------------------------------------ #
     api_host: str = Field("127.0.0.1", alias="API_HOST")
     api_port: int = Field(8005, alias="API_PORT")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     log_dir: str = Field("logs", alias="LOG_DIR")
     log_format: LogFormat = Field("text", alias="LOG_FORMAT")
     service_version: str = Field("1.0.0", alias="SERVICE_VERSION")
-
     resume_active_workflows_on_boot: bool = Field(
         True,
         alias="RESUME_ACTIVE_WORKFLOWS_ON_BOOT",

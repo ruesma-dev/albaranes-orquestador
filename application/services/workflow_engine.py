@@ -1,18 +1,11 @@
 # application/services/workflow_engine.py
 """Motor genérico de ejecución de workflows.
 
-Responsabilidades:
-  - Cargar el WorkflowRun de BBDD por id.
-  - Ejecutar la transición que toque para su current_state activo,
-    delegando al workflow concreto (AlbaranE2EWorkflow).
-  - Persistir el cambio de estado y registrar workflow_step_history
-    para auditoría.
-  - Encadenar transiciones automáticas mientras current_state ∈ ACTIVE_STATES.
-  - Detenerse cuando entra en estado pasivo (waiting_*) o terminal.
-
-NO conoce los workflows concretos: solo conoce el patrón de ejecución.
-La selección de qué método invocar la hace por el ``current_state`` y
-una tabla interna de handlers que se registra al construir el engine.
+CAMBIO RESPECTO A LA VERSIÓN ANTERIOR:
+  - Nuevo step ``review_with_llm`` registrado en _STEP_NAME_BY_STATE.
+  - Nuevo dispatch_handler ``handle_reviewing`` para el estado
+    REVIEWING.
+  - Tabla _failure_state_for actualizada con REVIEWING → REVIEW_FAILED.
 """
 from __future__ import annotations
 
@@ -30,6 +23,7 @@ from application.workflows.albaran_e2e_workflow import (
 from domain.models.workflow import (
     ACTIVE_STATES,
     StepHistoryEntry,
+    TERMINAL_OK_STATES,
     TERMINAL_STATES,
     WorkflowRun,
     WorkflowState,
@@ -43,6 +37,7 @@ logger = logging.getLogger(__name__)
 _STEP_NAME_BY_STATE = {
     WorkflowState.EMAIL_RECEIVED: "ingest_event",
     WorkflowState.EXTRACTING: "extract_with_llm",
+    WorkflowState.REVIEWING: "review_with_llm",
     WorkflowState.PERSISTING: "persist_albaran",
     WorkflowState.VALUING: "run_valuation",
 }
@@ -53,9 +48,6 @@ def _utc_iso() -> str:
 
 
 class WorkflowEngine:
-    """Motor que ejecuta transiciones activas hasta llegar a un estado
-    pasivo o terminal."""
-
     def __init__(
         self,
         *,
@@ -69,10 +61,6 @@ class WorkflowEngine:
         self._existing_doc_resolver = existing_doc_resolver
         self._tmpdir_cleanup = tmpdir_cleanup
 
-    # ----------------------------------------------------------- #
-    # Crear un workflow nuevo (lo invoca el dispatcher al recibir
-    # email-received tras pasar el guard de idempotencia).
-    # ----------------------------------------------------------- #
     def create_workflow(
         self,
         *,
@@ -86,7 +74,7 @@ class WorkflowEngine:
         now = _utc_iso()
         run = WorkflowRun(
             id=str(uuid.uuid4()),
-            kind=kind,  # type: ignore[arg-type]
+            kind=kind,
             correlation_key=correlation_key,
             current_state=initial_state,
             payload=payload,
@@ -105,10 +93,6 @@ class WorkflowEngine:
         )
         return run
 
-    # ----------------------------------------------------------- #
-    # Loop de ejecución: ejecuta transiciones mientras el estado sea
-    # activo. Se ejecuta dentro de un BackgroundTask de FastAPI.
-    # ----------------------------------------------------------- #
     def run_until_passive(self, workflow_id: str) -> None:
         run = self._repo.find_by_id(workflow_id)
         if run is None:
@@ -117,7 +101,10 @@ class WorkflowEngine:
         self._loop(run)
 
     def _loop(self, run: WorkflowRun) -> None:
-        max_steps = 10  # safety: evita bucles si hay un bug.
+        # Subimos el límite a 12 porque ahora hay 5 estados activos
+        # encadenables (email_received → extracting → reviewing →
+        # persisting → valuing) más margen.
+        max_steps = 12
         steps_done = 0
 
         while run.current_state in ACTIVE_STATES and steps_done < max_steps:
@@ -157,7 +144,7 @@ class WorkflowEngine:
         t0 = time.time()
         try:
             outcome = self._dispatch_handler(run)
-        except Exception as exc:  # pragma: no cover (defensivo)
+        except Exception as exc:
             logger.exception(
                 "step=%s CRASHED: %s",
                 step_name,
@@ -171,7 +158,6 @@ class WorkflowEngine:
 
         duration_ms = int((time.time() - t0) * 1000)
 
-        # Cerramos el step en step_history.
         step.status = "success" if outcome.error is None else "failure"
         step.completed_at_utc = _utc_iso()
         step.duration_ms = duration_ms
@@ -195,7 +181,6 @@ class WorkflowEngine:
                 extra={"workflow_id": run.id},
             )
 
-        # Aplicamos transición.
         previous = run.current_state
         run.current_state = outcome.next_state
         run.updated_at_utc = _utc_iso()
@@ -209,7 +194,7 @@ class WorkflowEngine:
         if outcome.error:
             run.last_error = outcome.error
         else:
-            run.last_error = None  # limpia error previo si hubo retry exitoso
+            run.last_error = None
 
         logger.info(
             "state: %s → %s",
@@ -226,6 +211,8 @@ class WorkflowEngine:
             return self._workflow.handle_email_received(run)
         if state == WorkflowState.EXTRACTING:
             return self._workflow.handle_extracting(run)
+        if state == WorkflowState.REVIEWING:
+            return self._workflow.handle_reviewing(run)
         if state == WorkflowState.PERSISTING:
             return self._workflow.handle_persisting(
                 run,
@@ -241,6 +228,7 @@ class WorkflowEngine:
     def _failure_state_for(state: WorkflowState) -> WorkflowState:
         return {
             WorkflowState.EXTRACTING: WorkflowState.EXTRACTION_FAILED,
+            WorkflowState.REVIEWING: WorkflowState.REVIEW_FAILED,
             WorkflowState.PERSISTING: WorkflowState.PERSISTENCE_FAILED,
             WorkflowState.VALUING: WorkflowState.VALUATION_FAILED,
         }.get(state, WorkflowState.EXTRACTION_FAILED)
@@ -262,22 +250,42 @@ class WorkflowEngine:
             duration_s,
             extra={"workflow_id": run.id},
         )
-        # Limpiamos el adjunto temporal si lo había.
-        file_path = run.payload.get("file_path") if run.payload else None
-        if file_path and self._tmpdir_cleanup is not None:
-            try:
-                self._tmpdir_cleanup(file_path)
-            except Exception:
-                logger.warning(
-                    "no se pudo limpiar tmpfile=%s",
-                    file_path,
-                    extra={"workflow_id": run.id},
-                )
 
-    # ----------------------------------------------------------- #
-    # Reanudar workflows tras un evento pasivo (contract-selected,
-    # document-approved). Lo llama el event_dispatcher.
-    # ----------------------------------------------------------- #
+        # IMPORTANTE — Política de limpieza del tmpfile:
+        #
+        #  - Solo limpiamos en estados TERMINAL_OK (approved,
+        #    completed_duplicate). En estos no vamos a reintentar.
+        #  - En *_failed NO limpiamos: el FailedWorkflowRetrier
+        #    (asyncio task de fondo) reabrirá el workflow y
+        #    necesita el archivo para reintentar la fase. Si lo
+        #    borrásemos, los retries siempre fallarían con
+        #    FileNotFoundError.
+        #
+        # El tmpfile puede quedar huérfano si el retry agota sus
+        # 3 intentos. Es preferible esa "fuga" leve a un sistema
+        # que no puede reintentar; los logs avisan tras el último
+        # intento y el operador puede limpiar /tmp/sv7 manualmente
+        # o con un cron de housekeeping.
+        if run.current_state in TERMINAL_OK_STATES:
+            file_path = run.payload.get("file_path") if run.payload else None
+            if file_path and self._tmpdir_cleanup is not None:
+                try:
+                    self._tmpdir_cleanup(file_path)
+                except Exception:
+                    logger.warning(
+                        "no se pudo limpiar tmpfile=%s",
+                        file_path,
+                        extra={"workflow_id": run.id},
+                    )
+        else:
+            # Estado FAILED — dejamos el tmpfile para que el retrier
+            # pueda reabrir el workflow.
+            logger.info(
+                "tmpfile preservado para posible retry (state=%s)",
+                run.current_state.value,
+                extra={"workflow_id": run.id},
+            )
+
     def resume_from_passive(
         self,
         workflow_id: str,

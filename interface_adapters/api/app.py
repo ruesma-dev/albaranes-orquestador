@@ -1,8 +1,6 @@
 # interface_adapters/api/app.py
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import os
 import uuid
@@ -38,6 +36,7 @@ from domain.models.workflow import (
 )
 from infrastructure.clients.http_extractor_client import HttpExtractorClient
 from infrastructure.clients.http_persister_client import HttpPersisterClient
+from infrastructure.clients.http_reviewer_client import HttpReviewerClient
 from infrastructure.clients.http_valuator_client import HttpValuatorClient
 from infrastructure.database.session_factory import SessionFactory
 from infrastructure.database.sqlalchemy_workflow_repository import (
@@ -47,13 +46,7 @@ from infrastructure.database.sqlalchemy_workflow_repository import (
 logger = logging.getLogger(__name__)
 
 
-def _save_upload_to_tmp(
-    *,
-    upload: UploadFile,
-    tmpdir: Path,
-) -> Path:
-    """Guarda el adjunto en tmpdir con nombre único; lo limpiará el
-    engine al terminar el workflow (success o failed)."""
+def _save_upload_to_tmp(*, upload: UploadFile, tmpdir: Path) -> Path:
     tmpdir.mkdir(parents=True, exist_ok=True)
     suffix = Path(upload.filename or "attachment").suffix or ".bin"
     target = tmpdir / f"{uuid.uuid4()}{suffix}"
@@ -78,13 +71,13 @@ def build_app(settings: Settings) -> FastAPI:
     # Composition root.
     # ----------------------------------------------------------- #
     sf = SessionFactory(
-                database_url=settings.database_url,
-                admin_database_url=settings.admin_database_url,
-                target_database_name=settings.pg_db,
-                auto_create_database=settings.auto_create_database,
-            )
+        database_url=settings.database_url,
+        admin_database_url=settings.admin_database_url,
+        target_database_name=settings.pg_db,
+        auto_create_database=settings.auto_create_database,
+    )
     repo = SqlAlchemyWorkflowRepository(sf)
-    repo.initialize()  # CREATE IF NOT EXISTS de las 2 tablas + índices.
+    repo.initialize()
 
     retry_policy = HttpRetryPolicy(
         max_attempts=settings.http_max_retries,
@@ -92,10 +85,18 @@ def build_app(settings: Settings) -> FastAPI:
         backoff_cap_s=settings.http_backoff_cap_s,
     )
 
+    # sv2 fase 1 → ExtractorClient
     extractor_client = HttpExtractorClient(
         base_url=settings.sv2_base_url,
-        path_extract=settings.sv2_path_extract,
+        path_extract=settings.sv2_path_extract_phase_1,
         timeout_s=settings.sv2_timeout_s,
+        retry_policy=retry_policy,
+    )
+    # sv2 fase 2 → ReviewerClient (NUEVO)
+    reviewer_client = HttpReviewerClient(
+        base_url=settings.sv2_base_url,
+        path_review=settings.sv2_path_extract_phase_2,
+        timeout_s=settings.sv2_review_timeout_s,
         retry_policy=retry_policy,
     )
     persister_client = HttpPersisterClient(
@@ -114,8 +115,10 @@ def build_app(settings: Settings) -> FastAPI:
 
     workflow = AlbaranE2EWorkflow(
         extractor=extractor_client,
+        reviewer=reviewer_client,
         persister=persister_client,
         valuator=valuator_client,
+        apply_phase_2_patch=settings.apply_phase_2_patch,
     )
     existing_resolver = ExistingDocResolver(sf)
 
@@ -142,11 +145,8 @@ def build_app(settings: Settings) -> FastAPI:
     tmpdir = Path(settings.tmpdir_path)
     tmpdir.mkdir(parents=True, exist_ok=True)
 
-    # ----------------------------------------------------------- #
-    # Lifespan: arranca retrier + retoma workflows activos al boot.
-    # ----------------------------------------------------------- #
     @asynccontextmanager
-    async def lifespan(app: FastAPI):  # noqa: ANN201
+    async def lifespan(app: FastAPI):
         if settings.resume_active_workflows_on_boot:
             _resume_active_workflows(engine=engine, repository=repo)
         await retrier.start()
@@ -165,9 +165,6 @@ def build_app(settings: Settings) -> FastAPI:
     app.state.engine = engine
     app.state.dispatcher = dispatcher
 
-    # ----------------------------------------------------------- #
-    # GET /health
-    # ----------------------------------------------------------- #
     @app.get("/health")
     def health() -> dict[str, Any]:
         return {
@@ -175,11 +172,17 @@ def build_app(settings: Settings) -> FastAPI:
             "service": "albaranes-orchestrator-api",
             "version": settings.service_version,
             "retrier_enabled": retrier.enabled,
+            "phase_2_mode": (
+                "merge" if settings.apply_phase_2_patch else "shadow"
+            ),
+            "downstream_paths": {
+                "sv2_phase_1": settings.sv2_path_extract_phase_1,
+                "sv2_phase_2": settings.sv2_path_extract_phase_2,
+                "sv3_persist": settings.sv3_path_persist,
+                "sv6_run": settings.sv6_path_run,
+            },
         }
 
-    # ----------------------------------------------------------- #
-    # POST /v1/events/email-received
-    # ----------------------------------------------------------- #
     @app.post("/v1/events/email-received")
     async def email_received(
         background_tasks: BackgroundTasks,
@@ -211,14 +214,10 @@ def build_app(settings: Settings) -> FastAPI:
                 workflow_id=workflow_id_to_run,
             )
         else:
-            # Era duplicado: nada más que ejecutar, limpiamos el tmp.
             _cleanup_tmpfile(str(saved_path))
 
         return ack
 
-    # ----------------------------------------------------------- #
-    # POST /v1/events/contract-selected
-    # ----------------------------------------------------------- #
     @app.post("/v1/events/contract-selected")
     async def contract_selected(
         background_tasks: BackgroundTasks,
@@ -244,9 +243,6 @@ def build_app(settings: Settings) -> FastAPI:
             )
         return result
 
-    # ----------------------------------------------------------- #
-    # POST /v1/events/document-approved
-    # ----------------------------------------------------------- #
     @app.post("/v1/events/document-approved")
     async def document_approved(event: DocumentApprovedEvent):
         logger.info(
@@ -256,9 +252,6 @@ def build_app(settings: Settings) -> FastAPI:
         )
         return dispatcher.handle_document_approved(event)
 
-    # ----------------------------------------------------------- #
-    # GET /v1/workflows/{id}
-    # ----------------------------------------------------------- #
     @app.get("/v1/workflows/{workflow_id}")
     def get_workflow(workflow_id: str):
         run = repo.find_by_id(workflow_id)
@@ -279,9 +272,6 @@ def build_app(settings: Settings) -> FastAPI:
             "payload_keys": list(run.payload.keys()) if run.payload else [],
         }
 
-    # ----------------------------------------------------------- #
-    # POST /v1/workflows/{id}/retry-from-step
-    # ----------------------------------------------------------- #
     @app.post("/v1/workflows/{workflow_id}/retry-from-step")
     def retry_from_step(
         workflow_id: str,
@@ -299,6 +289,7 @@ def build_app(settings: Settings) -> FastAPI:
 
         if target_state not in {
             WorkflowState.EXTRACTING,
+            WorkflowState.REVIEWING,
             WorkflowState.PERSISTING,
             WorkflowState.VALUING,
         }:
@@ -326,8 +317,7 @@ def build_app(settings: Settings) -> FastAPI:
 
 
 # --------------------------------------------------------------- #
-# Helpers de ejecución segura desde BackgroundTasks (capturan
-# excepciones para que un fallo no rompa el background runner).
+# Helpers de ejecución segura.
 # --------------------------------------------------------------- #
 def _run_engine_safely(*, engine: WorkflowEngine, workflow_id: str) -> None:
     try:
@@ -364,19 +354,10 @@ def _resume_active_workflows(
     engine: WorkflowEngine,
     repository,
 ) -> None:
-    """Al arrancar, busca workflows en estados activos y los retoma.
-
-    Cubre el caso de reinicio del proceso con BackgroundTasks en vuelo:
-    sin esto, los workflows quedarían atascados en current_state activo
-    (extracting/persisting/valuing) hasta que un humano los reabriera.
-    """
     candidates = repository.list_in_states(list(ACTIVE_STATES), limit=200)
     if not candidates:
         return
-    logger.info(
-        "boot: %d workflow(s) en estado activo, retomando…",
-        len(candidates),
-    )
+    logger.info("boot: %d workflow(s) en estado activo, retomando…", len(candidates))
     for run in candidates:
         try:
             engine.run_until_passive(run.id)

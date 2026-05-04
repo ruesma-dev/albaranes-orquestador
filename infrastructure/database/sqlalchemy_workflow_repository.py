@@ -209,6 +209,38 @@ _REVIEW_DDL: tuple[str, ...] = (
 )
 
 
+# =============================================================== #
+# DDL replicado de sv3 — bloque NUEVO de fase 2.
+#
+# Añade columnas que sv3 (Phase2PersistenceService) escribirá tras el
+# persist principal, y que sv4 leerá para mostrar al revisor el
+# estado de la revisión IA.
+#
+# Copiado literalmente del bloque _PHASE2_DDL del sv3
+# (infrastructure/database/phase2_ddl.py). Mantener sincronizado:
+# si en sv3 se añaden / cambian columnas, replicar aquí también.
+# =============================================================== #
+_PHASE2_DDL: tuple[str, ...] = (
+    # albaran_documents_merge — metadatos a nivel documento.
+    "ALTER TABLE albaran_documents_merge "
+    "ADD COLUMN IF NOT EXISTS review_phase2_status VARCHAR(32)",
+    "ALTER TABLE albaran_documents_merge "
+    "ADD COLUMN IF NOT EXISTS review_phase2_summary TEXT",
+    "ALTER TABLE albaran_documents_merge "
+    "ADD COLUMN IF NOT EXISTS review_phase2_changes_count INTEGER",
+    "ALTER TABLE albaran_documents_merge "
+    "ADD COLUMN IF NOT EXISTS review_phase2_payload_json TEXT",
+    "CREATE INDEX IF NOT EXISTS ix_albaran_documents_merge_review_phase2_status "
+    "ON albaran_documents_merge(review_phase2_status)",
+    # albaran_lines_merge — marca por línea de qué fase proviene.
+    "ALTER TABLE albaran_lines_merge "
+    "ADD COLUMN IF NOT EXISTS source_phase VARCHAR(16) "
+    "NOT NULL DEFAULT 'phase_1'",
+    "CREATE INDEX IF NOT EXISTS ix_albaran_lines_merge_source_phase "
+    "ON albaran_lines_merge(source_phase)",
+)
+
+
 class SqlAlchemyWorkflowRepository(WorkflowRepository):
     """Implementación SQLAlchemy del WorkflowRepository.
 
@@ -221,18 +253,22 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
                 contrato_cache_lines.
          - sv6: albaran_valuations, albaran_line_valuations,
                 contrato_lines_derived (con ALTER de sub-tandas 2C/2D).
-         - sv4: ALTER de columnas de revisión sobre las tablas merge.
+         - sv4: ALTER de columnas de revisión humana sobre las tablas merge.
+         - sv3 (NUEVO fase 2): ALTER de columnas review_phase2_* en
+                albaran_documents_merge y source_phase en
+                albaran_lines_merge.
       3. Todo es idempotente: si las tablas ya existen (porque sv3/sv4/sv6
          arrancaron antes), no las toca.
 
     Esto permite arrancar el sistema en cualquier orden — incluso sv7
     primero — sin que el primer evento de email falle por tablas
-    inexistentes.
+    o columnas inexistentes.
 
     REGLA DE MANTENIMIENTO:
       Cuando alguien cambie un schema en sv3/sv4/sv6, debe replicar el
-      cambio aquí (en external_schemas/ o en _VALUATION_DDL/_REVIEW_DDL
-      según corresponda). Ver external_schemas/__init__.py.
+      cambio aquí (en external_schemas/ o en _VALUATION_DDL /
+      _REVIEW_DDL / _PHASE2_DDL según corresponda).
+      Ver external_schemas/__init__.py.
     """
 
     def __init__(self, session_factory: SessionFactory) -> None:
@@ -259,7 +295,8 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
         self._initialized = True
         logger.info(
             "Bootstrap completo: workflow_runs + workflow_step_history + "
-            "tablas merge (sv3) + valoración (sv6) + columnas revisión (sv4)"
+            "tablas merge (sv3) + valoración (sv6) + columnas revisión "
+            "humana (sv4) + columnas revisión IA fase 2 (sv3 nuevo)"
         )
 
     def _create_workflow_tables(self) -> None:
@@ -292,7 +329,8 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
             )
 
     def _execute_external_ddl(self) -> None:
-        """Ejecuta el DDL crudo de valoración (sv6) y revisión (sv4)."""
+        """Ejecuta el DDL crudo de valoración (sv6), revisión humana (sv4)
+        y revisión IA fase 2 (sv3 nuevo)."""
         with self._sf.create_session() as session:
             # Valoración (sv6).
             try:
@@ -309,7 +347,7 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
                     "Fallo aplicando DDL de valoración. Continuamos."
                 )
 
-            # Revisión (sv4).
+            # Revisión humana (sv4).
             try:
                 logger.info(
                     "Ejecutando %d sentencias DDL de revisión (sv4)…",
@@ -322,6 +360,21 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
                 session.rollback()
                 logger.exception(
                     "Fallo aplicando DDL de revisión. Continuamos."
+                )
+
+            # Revisión IA — fase 2 (sv3 nuevo).
+            try:
+                logger.info(
+                    "Ejecutando %d sentencias DDL de revisión IA fase 2 (sv3)…",
+                    len(_PHASE2_DDL),
+                )
+                for stmt in _PHASE2_DDL:
+                    session.execute(text(stmt))
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception(
+                    "Fallo aplicando DDL de revisión IA fase 2. Continuamos."
                 )
 
     @staticmethod

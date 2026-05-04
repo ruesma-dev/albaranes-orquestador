@@ -1,34 +1,28 @@
 # application/workflows/albaran_e2e_workflow.py
-"""Workflow concreto: ingesta end-to-end de un albarán.
-
-Modelado como state machine. El motor (WorkflowEngine) llama a
-``advance(state)`` para ejecutar la transición que toque desde el
-estado activo actual.
+"""Workflow concreto: ingesta end-to-end de un albarán con DOS fases IA.
 
 Estados activos manejados:
   - email_received  → extracting (transición trivial, prepara contexto)
-  - extracting      → llama sv2 → persisting | extraction_failed
+  - extracting      → llama sv2 phase-1 → reviewing | extraction_failed
+  - reviewing       → llama sv2 phase-2 → persisting | review_failed
   - persisting      → llama sv3 → valuing | awaiting_contract_selection |
                                   completed_duplicate | persistence_failed
   - valuing         → llama sv6 → awaiting_approval | valuation_failed
 
-Estados pasivos:
-  - awaiting_contract_selection: el motor lo activa al recibir
-    contract-selected (ver event_dispatcher).
-  - awaiting_approval: idem con document-approved.
+FLAG ``apply_phase_2_patch`` (configurable por env APPLY_PHASE_2_PATCH):
+  - true  → tras fase 2, los cambios propuestos se APLICAN sobre el JSON
+            de fase 1 antes de mandarlo a sv3. Las líneas modificadas
+            quedan marcadas con source_phase='phase_2' en BBDD.
+  - false → SHADOW MODE: fase 2 se ejecuta igual y los cambios se
+            persisten como AUDITORÍA en review_phase2_payload_json,
+            pero el data que se manda a sv3 es el de fase 1 SIN tocar.
+            source_phase queda 'phase_1' en todas las líneas.
+            Útil para validar fase 2 sin contaminar BBDD.
 
-REGLA CRÍTICA del cliente sobre duplicados:
-  "Si el contrato ya existe el orquestador no lo baja y pasa al
-   siguiente paso." → cuando sv3 devuelve duplicate=true, sv7 NO
-  termina automáticamente en completed_duplicate. Mira si el
-  documento existente ya tiene valoración OK / aprobación, y decide:
-   - documento aprobado / valoración OK aprobada → completed_duplicate
-     terminal (no hay nada que hacer).
-   - documento con valoración OK pero sin aprobar → awaiting_approval
-     (saltarse extracción y persistencia, pasar al siguiente paso).
-   - documento sin valoración → valuing (re-aprovechar lo extraído y
-     persistido, valorar con el contrato seleccionado).
-   - documento sin contrato → awaiting_contract_selection.
+REGLA CRÍTICA del cliente sobre duplicados (mantenida sin cambios):
+  Si sv3 devuelve duplicate=true, sv7 NO termina automáticamente en
+  completed_duplicate: mira si el documento existente ya tiene
+  valoración OK / aprobación, y decide siguiente paso.
 """
 from __future__ import annotations
 
@@ -37,14 +31,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from application.utils.apply_patch_to_envelope import (
+    apply_patch_to_phase1_data,
+    build_review_metadata,
+)
 from domain.models.step_results import (
     ExtractResult,
     PersistResult,
+    ReviewResult,
     ValuationResult,
 )
 from domain.models.workflow import WorkflowRun, WorkflowState
 from domain.ports.extractor_port import ExtractionError, ExtractorClient
 from domain.ports.persister_port import PersisterClient, PersistenceError
+from domain.ports.reviewer_port import ReviewerClient, ReviewError
 from domain.ports.valuator_port import ValuationError, ValuatorClient
 
 logger = logging.getLogger(__name__)
@@ -54,11 +54,6 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-# --------------------------------------------------------------- #
-# Resultado de un step que el engine usa para tomar la decisión
-# de la siguiente transición. Se devuelve junto al output_payload
-# para auditoría.
-# --------------------------------------------------------------- #
 class StepOutcome:
     def __init__(
         self,
@@ -83,15 +78,23 @@ class AlbaranE2EWorkflow:
         self,
         *,
         extractor: ExtractorClient,
+        reviewer: ReviewerClient,
         persister: PersisterClient,
         valuator: ValuatorClient,
+        apply_phase_2_patch: bool = True,
     ) -> None:
         self._extractor = extractor
+        self._reviewer = reviewer
         self._persister = persister
         self._valuator = valuator
+        self._apply_phase_2_patch = apply_phase_2_patch
+        logger.info(
+            "[wf] AlbaranE2EWorkflow construido. apply_phase_2_patch=%s",
+            apply_phase_2_patch,
+        )
 
     # ----------------------------------------------------------- #
-    # email_received → extracting (trivial)
+    # email_received → extracting
     # ----------------------------------------------------------- #
     def handle_email_received(self, run: WorkflowRun) -> StepOutcome:
         logger.info(
@@ -101,7 +104,7 @@ class AlbaranE2EWorkflow:
         return StepOutcome(next_state=WorkflowState.EXTRACTING)
 
     # ----------------------------------------------------------- #
-    # extracting → persisting | extraction_failed
+    # extracting → reviewing | extraction_failed
     # ----------------------------------------------------------- #
     def handle_extracting(self, run: WorkflowRun) -> StepOutcome:
         payload = run.payload
@@ -110,7 +113,7 @@ class AlbaranE2EWorkflow:
         content_type = payload["attachment_content_type"]
 
         logger.info(
-            "→ POST sv2 /v1/albaranes/extract file=%s size=%s",
+            "→ POST sv2 /v1/albaranes/extract/phase-1 file=%s size=%s",
             filename,
             payload.get("attachment_size_bytes"),
             extra={"workflow_id": run.id},
@@ -124,7 +127,7 @@ class AlbaranE2EWorkflow:
             )
         except ExtractionError as exc:
             logger.error(
-                "← sv2 FAILED: %s",
+                "← sv2 phase-1 FAILED: %s",
                 exc,
                 extra={"workflow_id": run.id},
             )
@@ -134,24 +137,168 @@ class AlbaranE2EWorkflow:
             )
 
         logger.info(
-            "← sv2 OK providers=%s confidence_pct=%s",
-            result.providers_used,
+            "← sv2 phase-1 OK provider=%s confidence_pct=%s",
+            result.provider_used,
             result.confidence_pct,
             extra={"workflow_id": run.id},
         )
 
-        # Guardamos el envelope en el payload del workflow para que el
-        # siguiente step (persisting) lo encuentre. Esto es importante
-        # porque persisting puede ejecutarse en otro proceso si sv7
-        # se reinicia (tras leer el estado de BBDD).
-        run.payload["extraction_envelope"] = result.raw_envelope
+        # Guardamos el envelope de fase 1 en el payload del workflow.
+        run.payload["phase_1_envelope"] = result.raw_envelope
+
+        return StepOutcome(
+            next_state=WorkflowState.REVIEWING,
+            output_payload={
+                "provider_used": result.provider_used,
+                "confidence_pct": result.confidence_pct,
+            },
+        )
+
+    # ----------------------------------------------------------- #
+    # reviewing → persisting | review_failed
+    #
+    # Política ante fallo de fase 2:
+    #   - Si sv2 phase-2 falla en HTTP/red → review_failed (retryable).
+    #   - Si fase 2 devuelve review_status="inconsistent" → persistimos
+    #     IGUALMENTE (decisión validada con el usuario: "siempre
+    #     persistimos"). Si el flag apply_phase_2_patch=true, se aplican
+    #     los cambios propuestos. Si false, no.
+    #
+    # Política según el flag apply_phase_2_patch:
+    #   - true  → merged_data = fase_1_data CON el patch aplicado;
+    #             líneas tocadas marcadas source_phase='phase_2'.
+    #   - false → merged_data = fase_1_data SIN tocar (shadow mode);
+    #             review_phase2_metadata se incluye igualmente para
+    #             auditoría en sv3.
+    # ----------------------------------------------------------- #
+    def handle_reviewing(self, run: WorkflowRun) -> StepOutcome:
+        payload = run.payload
+        file_path = Path(payload["file_path"])
+        filename = payload["attachment_filename"]
+        content_type = payload["attachment_content_type"]
+
+        envelope_phase_1 = payload.get("phase_1_envelope")
+        if not envelope_phase_1:
+            return StepOutcome(
+                next_state=WorkflowState.REVIEW_FAILED,
+                error="phase_1_envelope ausente al entrar en reviewing",
+            )
+        phase_1_data = envelope_phase_1.get("data") or {}
+
+        logger.info(
+            "→ POST sv2 /v1/albaranes/extract/phase-2 file=%s",
+            filename,
+            extra={"workflow_id": run.id},
+        )
+        try:
+            review: ReviewResult = self._reviewer.review(
+                file_path=file_path,
+                filename=filename,
+                content_type=content_type,
+                phase_1_data=phase_1_data,
+            )
+        except ReviewError as exc:
+            logger.error(
+                "← sv2 phase-2 FAILED: %s",
+                exc,
+                extra={"workflow_id": run.id},
+            )
+            return StepOutcome(
+                next_state=WorkflowState.REVIEW_FAILED,
+                error=str(exc),
+            )
+
+        logger.info(
+            "← sv2 phase-2 OK provider=%s status=%s changes=%d",
+            review.provider_used,
+            review.review_status,
+            review.changes_count,
+            extra={"workflow_id": run.id},
+        )
+
+        # Lista de cambios propuestos por la fase 2.
+        cambios = (review.raw_envelope.get("data") or {}).get("cambios") or []
+
+        # ----- Aplicar (o no) el patch según el flag ----- #
+        if self._apply_phase_2_patch:
+            merged_data, apply_summary = apply_patch_to_phase1_data(
+                phase_1_data=phase_1_data,
+                cambios=cambios,
+            )
+            mode_label = "merge"
+        else:
+            # Shadow mode: NO modificamos los datos.
+            # Solo construimos un summary "vacío de aplicación" para
+            # que la auditoría refleje el comportamiento.
+            merged_data = phase_1_data
+            apply_summary = {
+                "applied_count": 0,
+                "rejected_count": 0,
+                "rejected_details": [],
+                "lines_phase2_count": 0,
+                "lines_phase2_indices": [],
+                "shadow_mode": True,
+                "proposed_count_when_shadow": len(cambios),
+            }
+            mode_label = "shadow"
+
+        # Construir el envelope final que se le pasará a sv3.
+        # En ambos modos llevamos el bloque review_phase2_metadata para
+        # que sv3 lo persista en columnas review_phase2_*.
+        review_metadata = build_review_metadata(
+            review_envelope=review.raw_envelope,
+            apply_summary=apply_summary,
+        )
+
+        # SANEO DEL META para que cumpla con el schema estricto
+        # ExtractionMeta de sv3 (extra='forbid'). sv2 fase-1 añade
+        # 'phase' y 'provider' al meta — son info INTERNA del flujo,
+        # no del documento. Las quitamos antes de cruzar la frontera
+        # hacia sv3.
+        meta_for_sv3 = {
+            k: v
+            for k, v in (envelope_phase_1.get("meta") or {}).items()
+            if k not in ("phase", "provider")
+        }
+
+        merged_envelope = {
+            "meta": meta_for_sv3,
+            "data": merged_data,
+            "debug": envelope_phase_1.get("debug") or {},
+            # NOTA: NO incluimos un bloque 'phase_2' top-level porque
+            # ExtractionEnvelope de sv3 tiene extra='forbid'. Toda la
+            # información de fase 2 viaja dentro de
+            # review_phase2_metadata.review_phase2_payload_json
+            # (que sv3 sí espera y persiste).
+            "review_phase2_metadata": review_metadata,
+        }
+        run.payload["merged_envelope_for_persist"] = merged_envelope
+
+        decision = (
+            f"phase_2 status={review.review_status} mode={mode_label} "
+            f"proposed={review.changes_count} "
+            f"applied={apply_summary['applied_count']} "
+            f"rejected={apply_summary['rejected_count']} "
+            f"lines_phase2={apply_summary['lines_phase2_count']}"
+        )
+        logger.info(
+            "decision: %s → persisting",
+            decision,
+            extra={"workflow_id": run.id},
+        )
 
         return StepOutcome(
             next_state=WorkflowState.PERSISTING,
             output_payload={
-                "providers_used": result.providers_used,
-                "confidence_pct": result.confidence_pct,
+                "review_status": review.review_status,
+                "review_provider": review.provider_used,
+                "review_mode": mode_label,
+                "changes_proposed": review.changes_count,
+                "changes_applied": apply_summary["applied_count"],
+                "changes_rejected": apply_summary["rejected_count"],
+                "lines_phase2_count": apply_summary["lines_phase2_count"],
             },
+            decision_log=decision,
         )
 
     # ----------------------------------------------------------- #
@@ -164,27 +311,18 @@ class AlbaranE2EWorkflow:
         *,
         existing_doc_resolver,
     ) -> StepOutcome:
-        """``existing_doc_resolver`` es una callable inyectada por el
-        engine que, dado un document_id, devuelve un dict con:
-            {
-                "is_approved": bool,
-                "has_valuation": bool,
-                "valuation_status": str | None,
-                "selected_contrato_codigo": str | None,
-            }
-        Lo usamos cuando sv3 devuelve duplicate=true para decidir
-        a qué estado saltar (regla del cliente: no bajar de nuevo, pasar
-        al siguiente paso).
-        """
         payload = run.payload
         file_path = Path(payload["file_path"])
         filename = payload["attachment_filename"]
         content_type = payload["attachment_content_type"]
-        envelope = payload.get("extraction_envelope")
+        envelope = payload.get("merged_envelope_for_persist")
         if envelope is None:
             return StepOutcome(
                 next_state=WorkflowState.PERSISTENCE_FAILED,
-                error="envelope de extracción ausente en payload del workflow",
+                error=(
+                    "merged_envelope_for_persist ausente — fase 2 no produjo "
+                    "envelope final"
+                ),
             )
 
         context = {
@@ -196,8 +334,11 @@ class AlbaranE2EWorkflow:
         }
 
         logger.info(
-            "→ POST sv3 /v1/albaranes/persist file=%s",
+            "→ POST sv3 /v1/albaranes/persist file=%s "
+            "review_phase2_status=%s changes_count=%d",
             filename,
+            (envelope.get("review_phase2_metadata") or {}).get("review_phase2_status"),
+            (envelope.get("review_phase2_metadata") or {}).get("review_phase2_changes_count"),
             extra={"workflow_id": run.id},
         )
 
@@ -225,9 +366,7 @@ class AlbaranE2EWorkflow:
             extra={"workflow_id": run.id},
         )
 
-        # ============================================================ #
-        # CASO DUPLICADO — regla del cliente
-        # ============================================================ #
+        # CASO DUPLICADO — regla del cliente.
         if result.duplicate:
             existing = existing_doc_resolver(result.document_id) or {}
 
@@ -250,7 +389,11 @@ class AlbaranE2EWorkflow:
                     f"duplicate y document {result.document_id} ya APROBADO "
                     "→ completed_duplicate (terminal ok)"
                 )
-                logger.info("decision: %s", decision, extra={"workflow_id": run.id})
+                logger.info(
+                    "decision: %s",
+                    decision,
+                    extra={"workflow_id": run.id},
+                )
                 return StepOutcome(
                     next_state=WorkflowState.COMPLETED_DUPLICATE,
                     output_payload={
@@ -267,7 +410,11 @@ class AlbaranE2EWorkflow:
                     f"duplicate y document {result.document_id} ya VALORADO "
                     "OK pero sin aprobar → awaiting_approval"
                 )
-                logger.info("decision: %s", decision, extra={"workflow_id": run.id})
+                logger.info(
+                    "decision: %s",
+                    decision,
+                    extra={"workflow_id": run.id},
+                )
                 return StepOutcome(
                     next_state=WorkflowState.AWAITING_APPROVAL,
                     output_payload={
@@ -285,7 +432,11 @@ class AlbaranE2EWorkflow:
                     f"duplicate y document {result.document_id} SIN contrato "
                     "seleccionado → awaiting_contract_selection"
                 )
-                logger.info("decision: %s", decision, extra={"workflow_id": run.id})
+                logger.info(
+                    "decision: %s",
+                    decision,
+                    extra={"workflow_id": run.id},
+                )
                 return StepOutcome(
                     next_state=WorkflowState.AWAITING_CONTRACT_SELECTION,
                     output_payload={
@@ -297,12 +448,15 @@ class AlbaranE2EWorkflow:
                     decision_log=decision,
                 )
 
-            # Tiene contrato seleccionado pero NO valoración OK → vamos a valuing.
             decision = (
                 f"duplicate y document {result.document_id} con contrato "
                 f"{selected} pero sin valoración → valuing"
             )
-            logger.info("decision: %s", decision, extra={"workflow_id": run.id})
+            logger.info(
+                "decision: %s",
+                decision,
+                extra={"workflow_id": run.id},
+            )
             run.payload["selected_contrato_codigo"] = selected
             return StepOutcome(
                 next_state=WorkflowState.VALUING,
@@ -316,15 +470,17 @@ class AlbaranE2EWorkflow:
                 decision_log=decision,
             )
 
-        # ============================================================ #
-        # CASO NO DUPLICADO — flujo normal
-        # ============================================================ #
+        # CASO NO DUPLICADO — flujo normal.
         if result.selected_contrato_codigo:
             decision = (
                 f"contrato auto-seleccionado ({result.selected_contrato_codigo}) "
                 "→ valuing directo"
             )
-            logger.info("decision: %s", decision, extra={"workflow_id": run.id})
+            logger.info(
+                "decision: %s",
+                decision,
+                extra={"workflow_id": run.id},
+            )
             run.payload["selected_contrato_codigo"] = result.selected_contrato_codigo
             return StepOutcome(
                 next_state=WorkflowState.VALUING,
@@ -337,12 +493,15 @@ class AlbaranE2EWorkflow:
                 decision_log=decision,
             )
 
-        # 0 ó >1 contratos sin auto-selección.
         decision = (
             f"contratos={result.contratos_count} sin auto-selección "
             "→ awaiting_contract_selection"
         )
-        logger.info("decision: %s", decision, extra={"workflow_id": run.id})
+        logger.info(
+            "decision: %s",
+            decision,
+            extra={"workflow_id": run.id},
+        )
         return StepOutcome(
             next_state=WorkflowState.AWAITING_CONTRACT_SELECTION,
             output_payload={
@@ -355,6 +514,7 @@ class AlbaranE2EWorkflow:
 
     # ----------------------------------------------------------- #
     # valuing → awaiting_approval | valuation_failed
+    # (sin cambios respecto a la versión anterior)
     # ----------------------------------------------------------- #
     def handle_valuing(self, run: WorkflowRun) -> StepOutcome:
         document_id = run.document_id
@@ -415,8 +575,6 @@ class AlbaranE2EWorkflow:
                 },
             )
 
-        # 'no_contract' u otros: marcar fallo y dejar que el revisor
-        # corrija (o el retrier reintente si el contrato cambió).
         return StepOutcome(
             next_state=WorkflowState.VALUATION_FAILED,
             error=f"sv6 devolvió status={result.status}",
