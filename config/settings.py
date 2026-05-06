@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import List, Literal
 from urllib.parse import quote_plus
 
 from pydantic import Field, model_validator
@@ -33,6 +33,15 @@ class Settings(BaseSettings):
                   en todas las líneas. Útil para shadow-mode: dejas
                   fase 2 corriendo y la observas sin que afecte a la
                   BBDD principal.
+
+    REFACTOR SCHEMA CONTRIBUTORS (mayo 2026):
+      - Nuevo SCHEMA_CONTRIBUTOR_URLS — lista de URLs base de los
+        servicios que CONTRIBUYEN tablas a la BBDD compartida (sv3 y
+        sv6). El sv7 al arrancar descubre su DDL vía GET /schema/ddl
+        y lo aplica en orden topológico.
+      - Eliminado el DDL replicado y desactualizado de sv3/sv4/sv6
+        que vivía dentro del sv7. Ahora cada servicio es la única
+        fuente de verdad para sus propias tablas.
     """
 
     # ------------------------------------------------------------ #
@@ -110,6 +119,42 @@ class Settings(BaseSettings):
         "/v1/valuation/{document_id}/re-run",
         alias="SV6_PATH_RERUN",
     )
+
+    # ------------------------------------------------------------ #
+    # Schema contributors.
+    #
+    # Lista de URLs base de los servicios que contribuyen tablas a la
+    # BBDD compartida. El sv7 al arrancar descubre su DDL vía
+    # GET /schema/ddl y lo aplica en orden topológico (resolviendo
+    # dependencias declaradas con SCHEMA_DEPENDS_ON).
+    #
+    # Por defecto apuntamos a los URLs locales de sv3 y sv6. En
+    # producción Azure se sobrescribe por .env.
+    # ------------------------------------------------------------ #
+    schema_contributor_urls_csv: str = Field(
+        "http://127.0.0.1:8001,http://127.0.0.1:8003",
+        alias="SCHEMA_CONTRIBUTOR_URLS",
+        description=(
+            "Lista CSV de URLs base de servicios que exponen "
+            "GET /schema/ddl. Ej: 'http://localhost:8001,http://localhost:8003'."
+        ),
+    )
+    schema_ddl_timeout_s: float = Field(
+        30.0,
+        alias="SCHEMA_DDL_TIMEOUT_S",
+        description="Timeout HTTP para descargar /schema/ddl.",
+    )
+
+    @property
+    def schema_contributor_urls(self) -> List[str]:
+        """Parsea la CSV en lista limpia (sin entradas vacías)."""
+        if not self.schema_contributor_urls_csv:
+            return []
+        return [
+            url.strip()
+            for url in self.schema_contributor_urls_csv.split(",")
+            if url.strip()
+        ]
 
     # ------------------------------------------------------------ #
     # Política de reintentos HTTP.

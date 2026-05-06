@@ -17,6 +17,11 @@ from fastapi import (
     UploadFile,
 )
 
+from application.pipelines.bootstrap_schema_pipeline import (
+    BootstrapSchemaError,
+    BootstrapSchemaRequest,
+    build_bootstrap_pipeline,
+)
 from application.retry.http_retry_policy import HttpRetryPolicy
 from application.services.event_dispatcher import EventDispatcher
 from application.services.existing_doc_resolver import ExistingDocResolver
@@ -37,6 +42,7 @@ from domain.models.workflow import (
 from infrastructure.clients.http_extractor_client import HttpExtractorClient
 from infrastructure.clients.http_persister_client import HttpPersisterClient
 from infrastructure.clients.http_reviewer_client import HttpReviewerClient
+from infrastructure.clients.http_schema_ddl_client import HttpSchemaDdlClient
 from infrastructure.clients.http_valuator_client import HttpValuatorClient
 from infrastructure.database.session_factory import SessionFactory
 from infrastructure.database.sqlalchemy_workflow_repository import (
@@ -69,6 +75,20 @@ def _cleanup_tmpfile(file_path: str) -> None:
 def build_app(settings: Settings) -> FastAPI:
     # ----------------------------------------------------------- #
     # Composition root.
+    #
+    # ORDEN DE BOOTSTRAP (importante):
+    #   1. SessionFactory (crea la BBDD si no existe — auto_create_database).
+    #   2. BootstrapSchemaPipeline → descubre y aplica el DDL contribuido
+    #      por sv3 y sv6 vía GET /schema/ddl. Esto crea las tablas que
+    #      esos servicios "poseen" en la BBDD compartida.
+    #   3. SqlAlchemyWorkflowRepository.initialize() → crea las tablas
+    #      propias del sv7 (workflow_runs, workflow_step_history).
+    #   4. Resto del wiring (clientes HTTP, workflow engine, etc.).
+    #
+    # IMPORTANTE: el sv3 y sv6 deben estar ARRIBA antes de arrancar
+    # el sv7. El bootstrap-pipeline llama a sus endpoints
+    # /schema/ddl. Si no responden, el sv7 falla en arranque
+    # explícitamente (mejor reventar pronto que aplicar schema parcial).
     # ----------------------------------------------------------- #
     sf = SessionFactory(
         database_url=settings.database_url,
@@ -76,15 +96,49 @@ def build_app(settings: Settings) -> FastAPI:
         target_database_name=settings.pg_db,
         auto_create_database=settings.auto_create_database,
     )
-    repo = SqlAlchemyWorkflowRepository(sf)
-    repo.initialize()
 
+    # Política de reintentos compartida (también la usan los demás clientes).
     retry_policy = HttpRetryPolicy(
         max_attempts=settings.http_max_retries,
         backoff_base_s=settings.http_backoff_base_s,
         backoff_cap_s=settings.http_backoff_cap_s,
     )
 
+    # ----- 2. Schema bootstrap (DDL contribuido por sv3 y sv6) ----- #
+    schema_ddl_client = HttpSchemaDdlClient(
+        timeout_s=settings.schema_ddl_timeout_s,
+        retry_policy=retry_policy,
+    )
+    bootstrap_pipeline = build_bootstrap_pipeline(
+        engine=sf.engine,
+        ddl_client=schema_ddl_client,
+    )
+    try:
+        bootstrap_report = bootstrap_pipeline.run(
+            BootstrapSchemaRequest(
+                contributor_urls=settings.schema_contributor_urls,
+            )
+        )
+        logger.info(
+            "[sv7][wiring] bootstrap-schema OK: %d contributors, "
+            "%d sentencias DDL aplicadas.",
+            len(bootstrap_report.applied),
+            bootstrap_report.total_statements,
+        )
+    except BootstrapSchemaError:
+        logger.exception(
+            "[sv7][wiring] FALLO en bootstrap-schema. El sv7 NO puede "
+            "arrancar sin un schema válido en la BBDD compartida. "
+            "Asegúrate de que sv3 y sv6 están arriba y exponen "
+            "GET /schema/ddl, y revisa SCHEMA_CONTRIBUTOR_URLS en .env."
+        )
+        raise
+
+    # ----- 3. Tablas propias del sv7 ------------------------------ #
+    repo = SqlAlchemyWorkflowRepository(sf)
+    repo.initialize()
+
+    # ----- 4. Resto del wiring ------------------------------------ #
     # sv2 fase 1 → ExtractorClient
     extractor_client = HttpExtractorClient(
         base_url=settings.sv2_base_url,
@@ -92,7 +146,7 @@ def build_app(settings: Settings) -> FastAPI:
         timeout_s=settings.sv2_timeout_s,
         retry_policy=retry_policy,
     )
-    # sv2 fase 2 → ReviewerClient (NUEVO)
+    # sv2 fase 2 → ReviewerClient
     reviewer_client = HttpReviewerClient(
         base_url=settings.sv2_base_url,
         path_review=settings.sv2_path_extract_phase_2,
@@ -164,6 +218,7 @@ def build_app(settings: Settings) -> FastAPI:
     app.state.repo = repo
     app.state.engine = engine
     app.state.dispatcher = dispatcher
+    app.state.bootstrap_report = bootstrap_report
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -181,6 +236,15 @@ def build_app(settings: Settings) -> FastAPI:
                 "sv3_persist": settings.sv3_path_persist,
                 "sv6_run": settings.sv6_path_run,
             },
+            "schema_contributors": [
+                {
+                    "schema_name": a.schema_name,
+                    "schema_version": a.schema_version,
+                    "contributor_base_url": a.contributor_base_url,
+                    "statements_applied": a.statements_applied,
+                }
+                for a in bootstrap_report.applied
+            ],
         }
 
     @app.post("/v1/events/email-received")

@@ -20,255 +20,41 @@ from infrastructure.database.orm_workflow_models import (
 )
 from infrastructure.database.session_factory import SessionFactory
 
-# =============================================================== #
-# Imports de los schemas REPLICADOS desde sv3.
-# Necesarios para que Base.metadata.create_all() conozca todas las
-# tablas merge y las cree si no existen. Ver
-# external_schemas/__init__.py para la regla de mantenimiento.
-# =============================================================== #
-from infrastructure.database.external_schemas.orm_models import (
-    Base as ExternalSchemasBase,
-)
-# Estos imports son requeridos para registrar las clases en
-# ExternalSchemasBase.metadata aunque luego no se usen explícitamente.
-import infrastructure.database.external_schemas.orm_models  # noqa: F401
-import infrastructure.database.external_schemas.orm_contrato_models  # noqa: F401
-import infrastructure.database.external_schemas.orm_contrato_cache_models  # noqa: F401
-
 logger = logging.getLogger(__name__)
 
 
 # =============================================================== #
-# DDL replicado de sv6 (vía sv3). Crea las tablas de valoración
-# que no son ORM en sv3 (albaran_valuations, albaran_line_valuations,
-# contrato_lines_derived) y aplica los ALTER de sub-tandas 2C/2D.
+# REFACTOR SCHEMA CONTRIBUTORS (mayo 2026):
 #
-# Copiado literalmente del bloque _VALUATION_DDL del sv3
-# (sqlalchemy_albaran_repository.py). Mantener sincronizado.
-# =============================================================== #
-_VALUATION_DDL: tuple[str, ...] = (
-    """
-    CREATE TABLE IF NOT EXISTS albaran_valuations (
-        id                        VARCHAR(36) PRIMARY KEY,
-        document_id               VARCHAR(36) NOT NULL UNIQUE
-            REFERENCES albaran_documents_merge(id) ON DELETE CASCADE,
-        contrato_codigo           VARCHAR(64),
-        status                    VARCHAR(32) NOT NULL,
-        provider_ia               VARCHAR(32),
-        model_name                VARCHAR(100),
-        prompt_key                VARCHAR(100),
-        total_valorado            DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-        total_lines               INTEGER NOT NULL DEFAULT 0,
-        lines_matched_exact       INTEGER NOT NULL DEFAULT 0,
-        lines_matched_semantic    INTEGER NOT NULL DEFAULT 0,
-        lines_matched_price_only  INTEGER NOT NULL DEFAULT 0,
-        lines_unmatched           INTEGER NOT NULL DEFAULT 0,
-        review_required           BOOLEAN NOT NULL DEFAULT FALSE,
-        review_reasons_json       TEXT,
-        raw_ia_envelope_json      TEXT,
-        created_at_utc            VARCHAR(64) NOT NULL,
-        updated_at_utc            VARCHAR(64)
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS ix_albaran_valuations_document_id "
-    "ON albaran_valuations(document_id)",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_valuations_status "
-    "ON albaran_valuations(status)",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_valuations_contrato_codigo "
-    "ON albaran_valuations(contrato_codigo)",
-    """
-    CREATE TABLE IF NOT EXISTS contrato_lines_derived (
-        id                        SERIAL PRIMARY KEY,
-        created_by_valuation_id   VARCHAR(36) NOT NULL
-            REFERENCES albaran_valuations(id) ON DELETE CASCADE,
-        source_document_id        VARCHAR(36) NOT NULL,
-        codigo_contrato           VARCHAR(64) NOT NULL,
-        codigo_producto           VARCHAR(64),
-        descripcion_linea         TEXT,
-        unidad_medida             VARCHAR(32),
-        precio_unitario           DOUBLE PRECISION,
-        codigo_partida            VARCHAR(64),
-        origen                    VARCHAR(32) NOT NULL,
-        created_at_utc            VARCHAR(64) NOT NULL
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS ix_contrato_lines_derived_created_by "
-    "ON contrato_lines_derived(created_by_valuation_id)",
-    "CREATE INDEX IF NOT EXISTS ix_contrato_lines_derived_source_doc "
-    "ON contrato_lines_derived(source_document_id)",
-    "CREATE INDEX IF NOT EXISTS ix_contrato_lines_derived_producto_partida "
-    "ON contrato_lines_derived(codigo_contrato, codigo_producto, codigo_partida)",
-    """
-    CREATE TABLE IF NOT EXISTS albaran_line_valuations (
-        id                             SERIAL PRIMARY KEY,
-        valuation_id                   VARCHAR(36) NOT NULL
-            REFERENCES albaran_valuations(id) ON DELETE CASCADE,
-        merge_line_id                  INTEGER NOT NULL
-            REFERENCES albaran_lines_merge(id) ON DELETE CASCADE,
-        matched_contrato_line_id       INTEGER
-            REFERENCES albaran_contrato_lines_merge(id) ON DELETE SET NULL,
-        derived_contrato_line_id       INTEGER
-            REFERENCES contrato_lines_derived(id) ON DELETE SET NULL,
-        precio_unitario_contrato_db    DOUBLE PRECISION,
-        precio_unitario_pdf_inferido   DOUBLE PRECISION,
-        precio_unitario_final          DOUBLE PRECISION,
-        precio_unitario_source         VARCHAR(32) NOT NULL,
-        precio_unitario_agreement      VARCHAR(32) NOT NULL,
-        unidad_albaran                 VARCHAR(32),
-        unidad_contrato                VARCHAR(32),
-        unidad_categoria               VARCHAR(32) NOT NULL,
-        unidad_category_match          BOOLEAN NOT NULL,
-        cantidad_albaran               DOUBLE PRECISION,
-        cantidad_convertida            DOUBLE PRECISION,
-        factor_conversion              DOUBLE PRECISION,
-        importe_calculado              DOUBLE PRECISION,
-        importe_albaran_declarado      DOUBLE PRECISION,
-        importe_source                 VARCHAR(32) NOT NULL,
-        codigo_partida_albaran         VARCHAR(64),
-        codigo_partida_final           VARCHAR(64),
-        partida_action                 VARCHAR(32) NOT NULL,
-        match_confidence_pct           DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-        match_method                   VARCHAR(32) NOT NULL,
-        review_required                BOOLEAN NOT NULL DEFAULT FALSE,
-        review_reasons_json            TEXT,
-        ia_reasoning                   TEXT,
-        created_at_utc                 VARCHAR(64) NOT NULL,
-        CONSTRAINT uq_albaran_line_valuations_val_line
-            UNIQUE (valuation_id, merge_line_id)
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_valuation_id "
-    "ON albaran_line_valuations(valuation_id)",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_merge_line_id "
-    "ON albaran_line_valuations(merge_line_id)",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_matched_contrato "
-    "ON albaran_line_valuations(matched_contrato_line_id)",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_derived_contrato "
-    "ON albaran_line_valuations(derived_contrato_line_id)",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_match_method "
-    "ON albaran_line_valuations(match_method)",
-    # ALTER de sub-tanda 2C (idempotentes)
-    "ALTER TABLE albaran_line_valuations "
-    "ADD COLUMN IF NOT EXISTS rol_linea VARCHAR(32)",
-    "ALTER TABLE albaran_line_valuations "
-    "ADD COLUMN IF NOT EXISTS ref_linea_base_merge_id INTEGER",
-    "ALTER TABLE albaran_line_valuations "
-    "ADD COLUMN IF NOT EXISTS tarifa_pdf_encontrada BOOLEAN",
-    "ALTER TABLE albaran_line_valuations "
-    "ADD COLUMN IF NOT EXISTS modifiers_applied_json TEXT",
-    # ALTER de sub-tanda 2D (idempotentes)
-    "ALTER TABLE albaran_line_valuations "
-    "ALTER COLUMN merge_line_id DROP NOT NULL",
-    "ALTER TABLE albaran_line_valuations "
-    "ADD COLUMN IF NOT EXISTS line_kind VARCHAR(32) "
-    "NOT NULL DEFAULT 'from_albaran'",
-    "ALTER TABLE albaran_line_valuations "
-    "ADD COLUMN IF NOT EXISTS parent_merge_line_id INTEGER",
-    "ALTER TABLE albaran_line_valuations "
-    "ADD COLUMN IF NOT EXISTS modifier_source VARCHAR(32)",
-    "ALTER TABLE albaran_line_valuations "
-    "ADD COLUMN IF NOT EXISTS modifier_reason TEXT",
-    "ALTER TABLE albaran_line_valuations "
-    "ADD COLUMN IF NOT EXISTS descripcion_linea TEXT",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_parent "
-    "ON albaran_line_valuations(parent_merge_line_id)",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_line_kind "
-    "ON albaran_line_valuations(line_kind)",
-)
-
-
-# =============================================================== #
-# DDL replicado de sv4. Añade las columnas de revisión humana
-# (approved, selected_contrato_codigo, etc.) a las tablas merge.
-# Copiado de review_repository.py de sv4. Mantener sincronizado.
-# =============================================================== #
-_REVIEW_DDL: tuple[str, ...] = (
-    "ALTER TABLE albaran_documents_merge ADD COLUMN IF NOT EXISTS approved BOOLEAN",
-    "UPDATE albaran_documents_merge SET approved = FALSE WHERE approved IS NULL",
-    "ALTER TABLE albaran_documents_merge ALTER COLUMN approved SET DEFAULT FALSE",
-    "ALTER TABLE albaran_documents_merge ALTER COLUMN approved SET NOT NULL",
-    "ALTER TABLE albaran_documents_merge ADD COLUMN IF NOT EXISTS approved_at_utc VARCHAR(64)",
-    "ALTER TABLE albaran_documents_merge ADD COLUMN IF NOT EXISTS approved_by VARCHAR(255)",
-    "ALTER TABLE albaran_documents_merge ADD COLUMN IF NOT EXISTS reviewed_at_utc VARCHAR(64)",
-    "ALTER TABLE albaran_documents_merge ADD COLUMN IF NOT EXISTS last_modified_at_utc VARCHAR(64)",
-    "ALTER TABLE albaran_documents_merge ADD COLUMN IF NOT EXISTS review_notes TEXT",
-    "ALTER TABLE albaran_documents_merge ADD COLUMN IF NOT EXISTS selected_contrato_codigo VARCHAR(64)",
-    "ALTER TABLE albaran_contratos_merge ADD COLUMN IF NOT EXISTS gra_rep_ide INTEGER",
-    "ALTER TABLE albaran_contratos_merge "
-    "ADD COLUMN IF NOT EXISTS pdf_sharepoint_relative_path VARCHAR(1024)",
-    "ALTER TABLE albaran_contratos_merge "
-    "ADD COLUMN IF NOT EXISTS pdf_sharepoint_web_url VARCHAR(1024)",
-    "ALTER TABLE albaran_contrato_lines_merge "
-    "ADD COLUMN IF NOT EXISTS codigo_partida VARCHAR(64)",
-    "ALTER TABLE albaran_contrato_lines_merge "
-    "ADD COLUMN IF NOT EXISTS descripcion_partida TEXT",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_documents_merge_approved "
-    "ON albaran_documents_merge(approved)",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_documents_merge_conf_calc "
-    "ON albaran_documents_merge(confidence_pct_calc)",
-)
-
-
-# =============================================================== #
-# DDL replicado de sv3 — bloque NUEVO de fase 2.
+# Eliminados de este archivo:
+#   - _VALUATION_DDL      → ahora vive en sv6 (schema_contribution.py)
+#   - _REVIEW_DDL         → ahora vive en sv3 (schema_contribution.py)
+#   - _PHASE2_DDL         → ahora vive en sv3 (schema_contribution.py)
+#   - imports de external_schemas/* → ya no se usa (deprecado)
 #
-# Añade columnas que sv3 (Phase2PersistenceService) escribirá tras el
-# persist principal, y que sv4 leerá para mostrar al revisor el
-# estado de la revisión IA.
+# El sv7 ya NO replica el schema de otros servicios. En su lugar, el
+# pipeline ``BootstrapSchemaPipeline`` descubre el DDL de cada
+# contributor vía GET /schema/ddl al arrancar y lo aplica antes de
+# que este repositorio inicialice las tablas propias del sv7.
 #
-# Copiado literalmente del bloque _PHASE2_DDL del sv3
-# (infrastructure/database/phase2_ddl.py). Mantener sincronizado:
-# si en sv3 se añaden / cambian columnas, replicar aquí también.
+# Este repositorio se queda SOLO con sus 2 tablas propias:
+#   - workflow_runs
+#   - workflow_step_history
 # =============================================================== #
-_PHASE2_DDL: tuple[str, ...] = (
-    # albaran_documents_merge — metadatos a nivel documento.
-    "ALTER TABLE albaran_documents_merge "
-    "ADD COLUMN IF NOT EXISTS review_phase2_status VARCHAR(32)",
-    "ALTER TABLE albaran_documents_merge "
-    "ADD COLUMN IF NOT EXISTS review_phase2_summary TEXT",
-    "ALTER TABLE albaran_documents_merge "
-    "ADD COLUMN IF NOT EXISTS review_phase2_changes_count INTEGER",
-    "ALTER TABLE albaran_documents_merge "
-    "ADD COLUMN IF NOT EXISTS review_phase2_payload_json TEXT",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_documents_merge_review_phase2_status "
-    "ON albaran_documents_merge(review_phase2_status)",
-    # albaran_lines_merge — marca por línea de qué fase proviene.
-    "ALTER TABLE albaran_lines_merge "
-    "ADD COLUMN IF NOT EXISTS source_phase VARCHAR(16) "
-    "NOT NULL DEFAULT 'phase_1'",
-    "CREATE INDEX IF NOT EXISTS ix_albaran_lines_merge_source_phase "
-    "ON albaran_lines_merge(source_phase)",
-)
 
 
 class SqlAlchemyWorkflowRepository(WorkflowRepository):
-    """Implementación SQLAlchemy del WorkflowRepository.
+    """Implementación SQLAlchemy del WorkflowRepository del sv7.
 
-    BOOTSTRAP COMPLETO al inicializar:
-      1. Crea las TABLAS PROPIAS de sv7 (workflow_runs, workflow_step_history).
-      2. Crea las TABLAS REPLICADAS DE OTROS SERVICIOS si no existen:
-         - sv3: albaran_documents, albaran_lines, albaran_documents_merge,
-                albaran_lines_merge, albaran_contratos_merge,
-                albaran_contrato_lines_merge, contratos_cache,
-                contrato_cache_lines.
-         - sv6: albaran_valuations, albaran_line_valuations,
-                contrato_lines_derived (con ALTER de sub-tandas 2C/2D).
-         - sv4: ALTER de columnas de revisión humana sobre las tablas merge.
-         - sv3 (NUEVO fase 2): ALTER de columnas review_phase2_* en
-                albaran_documents_merge y source_phase en
-                albaran_lines_merge.
-      3. Todo es idempotente: si las tablas ya existen (porque sv3/sv4/sv6
-         arrancaron antes), no las toca.
+    Bootstrap (idempotente): crea ``workflow_runs`` y
+    ``workflow_step_history``. Las tablas de otros servicios (sv3,
+    sv6) las habrá creado el ``BootstrapSchemaPipeline`` antes de
+    construir este repositorio.
 
-    Esto permite arrancar el sistema en cualquier orden — incluso sv7
-    primero — sin que el primer evento de email falle por tablas
-    o columnas inexistentes.
-
-    REGLA DE MANTENIMIENTO:
-      Cuando alguien cambie un schema en sv3/sv4/sv6, debe replicar el
-      cambio aquí (en external_schemas/ o en _VALUATION_DDL /
-      _REVIEW_DDL / _PHASE2_DDL según corresponda).
-      Ver external_schemas/__init__.py.
+    Si por alguna razón el bootstrap-pipeline no se ejecutó (modo
+    test, fallback manual, etc.), las consultas que hagan FK a esas
+    tablas fallarán claramente — pero las tablas propias del sv7
+    seguirán funcionando.
     """
 
     def __init__(self, session_factory: SessionFactory) -> None:
@@ -276,106 +62,21 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
         self._initialized = False
 
     # ----------------------------------------------------------- #
-    # Bootstrap de schema (idempotente).
+    # Bootstrap de schema PROPIO (idempotente).
     # ----------------------------------------------------------- #
     def initialize(self) -> None:
         if self._initialized:
             return
 
-        # Paso 1: crear todas las tablas ORM (sv7 propias + sv3 réplicas).
-        # Both sets of tables share the same SQLAlchemy MetaData via the
-        # ``Base`` declarativos. Como el ``Base`` de workflow_models es
-        # distinto del de external_schemas, los creamos por separado.
-        self._create_workflow_tables()
-        self._create_external_schemas_tables()
-
-        # Paso 2: ejecutar el DDL crudo (valoración + revisión).
-        self._execute_external_ddl()
-
-        self._initialized = True
-        logger.info(
-            "Bootstrap completo: workflow_runs + workflow_step_history + "
-            "tablas merge (sv3) + valoración (sv6) + columnas revisión "
-            "humana (sv4) + columnas revisión IA fase 2 (sv3 nuevo)"
-        )
-
-    def _create_workflow_tables(self) -> None:
-        """Crea las 2 tablas propias de sv7 con DDL crudo (idempotente)."""
         with self._sf.create_session() as session:
             for ddl in self._workflow_ddl_statements():
                 session.execute(text(ddl))
             session.commit()
-        logger.info("workflow_runs y workflow_step_history listas (DDL idempotente OK)")
 
-    def _create_external_schemas_tables(self) -> None:
-        """Crea las tablas merge replicadas (sv3) vía SQLAlchemy.
-
-        ``Base.metadata.create_all()`` con ``checkfirst=True`` (default)
-        es idempotente: solo crea las tablas que no existen ya.
-        """
-        try:
-            ExternalSchemasBase.metadata.create_all(
-                self._sf.engine,
-                checkfirst=True,
-            )
-            logger.info(
-                "Tablas merge (sv3 schema replicado) creadas o verificadas: %s",
-                sorted(ExternalSchemasBase.metadata.tables.keys()),
-            )
-        except Exception:
-            logger.exception(
-                "Error creando tablas del schema replicado (sv3). "
-                "Continuamos: si sv3 las crea después, no rompemos nada."
-            )
-
-    def _execute_external_ddl(self) -> None:
-        """Ejecuta el DDL crudo de valoración (sv6), revisión humana (sv4)
-        y revisión IA fase 2 (sv3 nuevo)."""
-        with self._sf.create_session() as session:
-            # Valoración (sv6).
-            try:
-                logger.info(
-                    "Ejecutando %d sentencias DDL de valoración (sv6)…",
-                    len(_VALUATION_DDL),
-                )
-                for stmt in _VALUATION_DDL:
-                    session.execute(text(stmt))
-                session.commit()
-            except Exception:
-                session.rollback()
-                logger.exception(
-                    "Fallo aplicando DDL de valoración. Continuamos."
-                )
-
-            # Revisión humana (sv4).
-            try:
-                logger.info(
-                    "Ejecutando %d sentencias DDL de revisión (sv4)…",
-                    len(_REVIEW_DDL),
-                )
-                for stmt in _REVIEW_DDL:
-                    session.execute(text(stmt))
-                session.commit()
-            except Exception:
-                session.rollback()
-                logger.exception(
-                    "Fallo aplicando DDL de revisión. Continuamos."
-                )
-
-            # Revisión IA — fase 2 (sv3 nuevo).
-            try:
-                logger.info(
-                    "Ejecutando %d sentencias DDL de revisión IA fase 2 (sv3)…",
-                    len(_PHASE2_DDL),
-                )
-                for stmt in _PHASE2_DDL:
-                    session.execute(text(stmt))
-                session.commit()
-            except Exception:
-                session.rollback()
-                logger.exception(
-                    "Fallo aplicando DDL de revisión IA fase 2. Continuamos."
-                )
+        self._initialized = True
+        logger.info(
+            "Bootstrap del sv7 completo: workflow_runs + workflow_step_history"
+        )
 
     @staticmethod
     def _workflow_ddl_statements() -> list[str]:
