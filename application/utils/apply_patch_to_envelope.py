@@ -1,251 +1,174 @@
 # application/utils/apply_patch_to_envelope.py
-"""Aplica el patch de fase 2 sobre el envelope de fase 1.
+"""Utilidades para construir el envelope final que sv7 manda a sv3.
 
-El envelope de fase 1 tiene la forma:
+NUEVO ENFOQUE — DICIEMBRE 2026:
 
-    {
-        "meta": {...},
-        "data": {                           # DocumentoAlbaran
-            "fecha": "2026-03-09",
-            "proveedor_cif": "B12345678",
-            ...
-            "lines": [
-                {"cantidad": 7.5, "precio": 100.0, "importe": 750.0, ...},
-                {"cantidad": 8.0, "precio": 50.0,  "importe": 400.0, ...},
-                ...
-            ]
-        },
-        "debug": {...}
-    }
+La fase 2 ahora devuelve el documento corregido COMPLETO
+(``documento_revisado``) con el mismo schema que fase 1, no una lista
+de cambios estructurados. Por tanto:
 
-El patch viene como lista de cambios en formato:
+  - YA NO hay que "aplicar un patch" sobre los datos de fase 1.
+    El ``documento_revisado`` ES directamente el JSON final.
+  - La trazabilidad "qué líneas tocó fase 2" se calcula por
+    diff entre el JSON original y el revisado.
+  - Si fase 2 dice ``review_status="ok"``, el documento revisado es
+    idéntico al de fase 1 (lo verificamos). Si dice
+    ``"ok_with_changes"`` o ``"inconsistent"``, hay diferencias.
 
-    {
-        "campo":          "lines[2].cantidad",
-        "valor_anterior": 7.5,
-        "valor_propuesto": 8.0,
-        "razon":          "...",
-        "patron_aplicado": "..."
-    }
+Funciones expuestas:
 
-Esta utilidad:
+  - ``extract_documento_revisado(review_envelope)`` →
+    extrae el JSON de fase 2 corregido del envelope.
 
-  1. Aplica los cambios sobre una COPIA del data de fase 1.
-  2. Marca cada línea modificada con ``source_phase='phase_2'``.
-  3. Devuelve:
-        - el data fusionado,
-        - los metadatos resumen para guardar en BBDD a nivel
-          documento (review_phase2_*).
+  - ``compute_phase2_line_indices(data_phase_1, data_revised)`` →
+    devuelve la lista de índices de líneas modificadas (o nuevas)
+    en el documento revisado. Sirve para marcar
+    ``source_phase='phase_2'`` en sv3.
+
+  - ``build_review_metadata(...)`` → construye el bloque
+    ``review_phase2_metadata`` que sv7 incrusta en el envelope para
+    que sv3 lo persista en ``albaran_documents_merge.review_phase2_*``.
 """
 from __future__ import annotations
 
-import copy
+import json
 import logging
-import re
-from typing import Any
+from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
 
-# Regex para parsear la notación dot/bracket: "lines[2].cantidad"
-# ─ se permiten chunks tipo `algo` y `algo[N]`.
-_TOKEN_RE = re.compile(r"([A-Za-z_][\w]*)(\[(\d+)\])?")
+def extract_documento_revisado(
+    review_envelope: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    """Devuelve ``data.documento_revisado`` del envelope fase 2.
 
-
-def parse_path(path: str) -> list[tuple[str, int | None]]:
-    """Convierte 'lines[2].cantidad' → [('lines', 2), ('cantidad', None)]."""
-    if not path or not isinstance(path, str):
-        raise ValueError(f"path inválido: {path!r}")
-    tokens: list[tuple[str, int | None]] = []
-    for raw_segment in path.split("."):
-        m = _TOKEN_RE.fullmatch(raw_segment.strip())
-        if not m:
-            raise ValueError(
-                f"segmento de path no parseable: '{raw_segment}' en '{path}'"
-            )
-        key = m.group(1)
-        index = int(m.group(3)) if m.group(3) is not None else None
-        tokens.append((key, index))
-    return tokens
-
-
-def apply_change(target: dict, path: str, new_value: Any) -> bool:
-    """Aplica un único cambio. Devuelve True si se modificó algo."""
-    tokens = parse_path(path)
-    cursor: Any = target
-
-    for i, (key, index) in enumerate(tokens):
-        is_last = i == len(tokens) - 1
-
-        # Bajar al hijo `key`.
-        if not isinstance(cursor, dict):
-            raise ValueError(
-                f"cursor no-dict al navegar '{path}' en segmento '{key}'"
-            )
-        if index is None:
-            # campo simple
-            if is_last:
-                cursor[key] = new_value
-                return True
-            if key not in cursor or cursor[key] is None:
-                cursor[key] = {}
-            cursor = cursor[key]
-        else:
-            # campo array → key[index]
-            arr = cursor.get(key)
-            if not isinstance(arr, list):
-                raise ValueError(
-                    f"se esperaba lista en '{key}' al navegar '{path}'"
-                )
-            if is_last:
-                # Último segmento: si new_value es None → eliminar.
-                if new_value is None:
-                    if 0 <= index < len(arr):
-                        arr.pop(index)
-                        return True
-                    return False
-                # Si index == len(arr) → append (línea nueva).
-                if index == len(arr):
-                    arr.append(new_value)
-                    return True
-                # Reemplazo dentro del rango.
-                if 0 <= index < len(arr):
-                    arr[index] = new_value
-                    return True
-                raise IndexError(
-                    f"índice {index} fuera de rango (len={len(arr)}) "
-                    f"en '{path}'"
-                )
-            # No es último: navegar al elemento del array.
-            if 0 <= index < len(arr):
-                cursor = arr[index]
-            else:
-                raise IndexError(
-                    f"índice {index} fuera de rango (len={len(arr)}) "
-                    f"en '{path}'"
-                )
-    return False
-
-
-def _line_index_from_path(path: str) -> int | None:
-    """Si el path empieza por 'lines[N]', devuelve N. Si no, None."""
-    m = re.match(r"^\s*lines\[(\d+)\]", path or "")
-    return int(m.group(1)) if m else None
-
-
-def apply_patch_to_phase1_data(
-    phase_1_data: dict,
-    cambios: list[dict],
-) -> tuple[dict, dict]:
-    """Aplica todos los cambios y marca las líneas afectadas.
-
-    Devuelve una tupla ``(merged_data, summary)``:
-
-      - ``merged_data``: copia profunda de ``phase_1_data`` con los
-        cambios aplicados. Las líneas modificadas o introducidas
-        nuevas tienen un campo ``source_phase='phase_2'``.
-      - ``summary``: dict con métricas para sv7/sv3:
-            {
-                "applied_count": int,
-                "rejected_count": int,
-                "rejected_details": [{"campo": "...", "error": "..."}],
-                "lines_phase2_count": int,
-                "lines_phase2_indices": [...]
-            }
+    Si no está presente o tiene tipo incorrecto, devuelve None.
     """
-    merged = copy.deepcopy(phase_1_data)
+    if not isinstance(review_envelope, dict):
+        return None
+    data = review_envelope.get("data") or {}
+    if not isinstance(data, dict):
+        return None
+    doc = data.get("documento_revisado")
+    if not isinstance(doc, dict):
+        return None
+    return doc
 
-    # Inicializamos source_phase='phase_1' para todas las líneas (los
-    # cambios sobreescribirán a 'phase_2' donde toque).
-    if isinstance(merged.get("lines"), list):
-        for line in merged["lines"]:
-            if isinstance(line, dict) and "source_phase" not in line:
-                line["source_phase"] = "phase_1"
 
-    applied = 0
-    rejected: list[dict] = []
-    touched_line_indices: set[int] = set()
+def compute_phase2_line_indices(
+    *,
+    data_phase_1: Dict[str, Any],
+    data_revised: Dict[str, Any],
+) -> List[int]:
+    """Diff entre las líneas de fase 1 y fase 2.
 
-    for cambio in cambios or []:
-        if not isinstance(cambio, dict):
-            rejected.append({
-                "campo": "?",
-                "error": "cambio no es dict",
-            })
+    Devuelve los índices (0-based, sobre ``data_revised.lineas``) de
+    las líneas que difieren respecto a fase 1. Esos son los que
+    deben marcarse ``source_phase='phase_2'`` en sv3.
+
+    Política:
+      - Si el número de líneas cambió: se marcan TODAS las nuevas/
+        modificadas. Es la opción más conservadora (no podemos
+        casar líneas 1:1 si se han añadido o eliminado).
+      - Si el número de líneas es igual: comparamos línea por línea
+        por igualdad estructural (después de normalizar None/"").
+    """
+    lines_1 = (data_phase_1 or {}).get("lineas") or []
+    lines_2 = (data_revised or {}).get("lineas") or []
+
+    if not isinstance(lines_1, list) or not isinstance(lines_2, list):
+        return []
+
+    if len(lines_1) != len(lines_2):
+        # Cambió el número de líneas — todas las del revisado se
+        # consideran "phase_2" (no hay forma fiable de aparearlas).
+        return list(range(len(lines_2)))
+
+    diffs: List[int] = []
+    for idx, (a, b) in enumerate(zip(lines_1, lines_2)):
+        if _normalize_line(a) != _normalize_line(b):
+            diffs.append(idx)
+    return diffs
+
+
+def _normalize_line(line: Any) -> Any:
+    """Normaliza una línea para comparar por igualdad.
+
+    Trata None y "" como equivalentes (la IA puede devolver uno o el
+    otro indistintamente y no queremos marcarlo como cambio).
+    """
+    if not isinstance(line, dict):
+        return line
+    out: Dict[str, Any] = {}
+    for k, v in line.items():
+        if v is None or v == "":
             continue
-        path = cambio.get("campo")
-        new_value = cambio.get("valor_propuesto")
-
-        # Línea afectada (si aplica) — la calculamos antes para saber
-        # qué marcar como phase_2 si el cambio se aplica con éxito.
-        line_idx = _line_index_from_path(path) if isinstance(path, str) else None
-
-        try:
-            changed = apply_change(merged, path, new_value)
-        except Exception as exc:
-            rejected.append({"campo": path or "?", "error": str(exc)})
-            logger.warning(
-                "[apply_patch] cambio rechazado: campo=%r error=%s",
-                path, exc,
-            )
-            continue
-
-        if not changed:
-            rejected.append({
-                "campo": path or "?",
-                "error": "no se aplicó ningún cambio",
-            })
-            continue
-
-        applied += 1
-        if line_idx is not None:
-            touched_line_indices.add(line_idx)
-
-    # Tras aplicar cambios: marcar las líneas tocadas con phase_2.
-    if isinstance(merged.get("lines"), list):
-        for idx in sorted(touched_line_indices):
-            if 0 <= idx < len(merged["lines"]):
-                line = merged["lines"][idx]
-                if isinstance(line, dict):
-                    line["source_phase"] = "phase_2"
-
-    summary = {
-        "applied_count": applied,
-        "rejected_count": len(rejected),
-        "rejected_details": rejected,
-        "lines_phase2_count": len(touched_line_indices),
-        "lines_phase2_indices": sorted(touched_line_indices),
-    }
-    return merged, summary
+        out[k] = v
+    return out
 
 
 def build_review_metadata(
-    review_envelope: dict,
-    apply_summary: dict,
-) -> dict:
-    """Construye el bloque review_phase2_* que se le pasa a sv3.
+    *,
+    review_envelope: Dict[str, Any],
+    phase_2_line_indices: List[int],
+) -> Dict[str, Any]:
+    """Construye el bloque ``review_phase2_metadata`` para sv3.
 
-    sv3 lo persiste en albaran_documents_merge:
+    sv3 lo persiste en ``albaran_documents_merge``:
       - review_phase2_status
       - review_phase2_summary
       - review_phase2_changes_count
-      - review_phase2_payload_json (JSON con la lista completa de cambios)
+      - review_phase2_payload_json
 
-    También conserva el resumen del apply (cuántos se aplicaron de
-    verdad vs cuántos rechazó la utilidad por path inválido, etc.).
+    El payload_json contiene la auditoría completa: status, resumen,
+    razonamientos y los índices de líneas que cambiaron (calculados
+    por sv7 mediante diff).
     """
-    data = review_envelope.get("data") or {}
-    cambios = data.get("cambios") or []
+    data = (review_envelope or {}).get("data") or {}
+    razonamientos = data.get("razonamientos") or []
+    review_status = data.get("review_status") or ""
+
     return {
-        "review_phase2_status": str(data.get("review_status") or ""),
+        "review_phase2_status": str(review_status),
         "review_phase2_summary": data.get("explicacion_global"),
-        "review_phase2_changes_count": len(cambios),
+        "review_phase2_changes_count": len(razonamientos),
         "review_phase2_payload_json": {
-            "review_status": data.get("review_status"),
+            "review_status": review_status,
             "explicacion_global": data.get("explicacion_global"),
-            "cambios": cambios,
-            "apply_summary": apply_summary,
-            "provider": (review_envelope.get("meta") or {}).get("provider"),
-            "model": (review_envelope.get("meta") or {}).get("model"),
+            "razonamientos": razonamientos,
+            "phase_2_line_indices": phase_2_line_indices,
+            "review_provider": (
+                (review_envelope.get("meta") or {}).get("provider")
+            ),
+            "review_model": (
+                (review_envelope.get("meta") or {}).get("model")
+            ),
         },
     }
+
+
+def mark_source_phase(
+    *,
+    data_revised: Dict[str, Any],
+    phase_2_line_indices: List[int],
+) -> Dict[str, Any]:
+    """Devuelve una copia de ``data_revised`` con cada línea marcada
+    con su ``source_phase`` (``'phase_1'`` o ``'phase_2'``).
+
+    Esta marca la lee el Phase2PersistenceService de sv3 después del
+    persist principal. Si la línea no existe (no hay ``lineas``), se
+    devuelve el dict tal cual.
+
+    NOTA: ``source_phase`` no es un campo del schema
+    ``DocumentoAlbaran`` (validado por Pydantic con ``extra='forbid'``).
+    Para evitar que sv3 falle, NO lo añadimos directamente al
+    documento. Lo metemos en ``review_phase2_metadata`` y dejamos que
+    sv3 lo persista por SQL UPDATE en ``albaran_lines_merge``.
+
+    Por tanto, esta función ahora simplemente devuelve
+    ``data_revised`` sin tocar (la lógica real de marcado vive en
+    sv3 leyendo ``phase_2_line_indices`` del metadata). Se mantiene
+    la firma por si en el futuro queremos cambiar el enfoque.
+    """
+    return data_revised

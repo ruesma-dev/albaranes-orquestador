@@ -32,8 +32,9 @@ from pathlib import Path
 from typing import Any
 
 from application.utils.apply_patch_to_envelope import (
-    apply_patch_to_phase1_data,
     build_review_metadata,
+    compute_phase2_line_indices,
+    extract_documento_revisado,
 )
 from domain.models.step_results import (
     ExtractResult,
@@ -216,38 +217,38 @@ class AlbaranE2EWorkflow:
             extra={"workflow_id": run.id},
         )
 
-        # Lista de cambios propuestos por la fase 2.
-        cambios = (review.raw_envelope.get("data") or {}).get("cambios") or []
+        # ----- Nuevo flujo: la fase 2 devuelve documento_revisado completo ----- #
+        documento_revisado = extract_documento_revisado(review.raw_envelope)
+        if documento_revisado is None:
+            return StepOutcome(
+                next_state=WorkflowState.REVIEW_FAILED,
+                error=(
+                    "Fase 2 no devolvió 'documento_revisado' válido en el "
+                    "envelope. Revisa el prompt o la respuesta de la IA."
+                ),
+            )
 
-        # ----- Aplicar (o no) el patch según el flag ----- #
+        # Decidir qué data se manda a sv3 según el flag.
         if self._apply_phase_2_patch:
-            merged_data, apply_summary = apply_patch_to_phase1_data(
-                phase_1_data=phase_1_data,
-                cambios=cambios,
+            # Modo merge: el documento revisado SUSTITUYE al de fase 1.
+            data_for_sv3 = documento_revisado
+            phase_2_line_indices = compute_phase2_line_indices(
+                data_phase_1=phase_1_data,
+                data_revised=documento_revisado,
             )
             mode_label = "merge"
         else:
-            # Shadow mode: NO modificamos los datos.
-            # Solo construimos un summary "vacío de aplicación" para
-            # que la auditoría refleje el comportamiento.
-            merged_data = phase_1_data
-            apply_summary = {
-                "applied_count": 0,
-                "rejected_count": 0,
-                "rejected_details": [],
-                "lines_phase2_count": 0,
-                "lines_phase2_indices": [],
-                "shadow_mode": True,
-                "proposed_count_when_shadow": len(cambios),
-            }
+            # Modo shadow: NO aplicamos los cambios, mandamos fase 1.
+            # Pero los razonamientos de fase 2 viajan en metadata para
+            # auditoría.
+            data_for_sv3 = phase_1_data
+            phase_2_line_indices = []
             mode_label = "shadow"
 
         # Construir el envelope final que se le pasará a sv3.
-        # En ambos modos llevamos el bloque review_phase2_metadata para
-        # que sv3 lo persista en columnas review_phase2_*.
         review_metadata = build_review_metadata(
             review_envelope=review.raw_envelope,
-            apply_summary=apply_summary,
+            phase_2_line_indices=phase_2_line_indices,
         )
 
         # SANEO DEL META para que cumpla con el schema estricto
@@ -263,23 +264,16 @@ class AlbaranE2EWorkflow:
 
         merged_envelope = {
             "meta": meta_for_sv3,
-            "data": merged_data,
+            "data": data_for_sv3,
             "debug": envelope_phase_1.get("debug") or {},
-            # NOTA: NO incluimos un bloque 'phase_2' top-level porque
-            # ExtractionEnvelope de sv3 tiene extra='forbid'. Toda la
-            # información de fase 2 viaja dentro de
-            # review_phase2_metadata.review_phase2_payload_json
-            # (que sv3 sí espera y persiste).
             "review_phase2_metadata": review_metadata,
         }
         run.payload["merged_envelope_for_persist"] = merged_envelope
 
         decision = (
             f"phase_2 status={review.review_status} mode={mode_label} "
-            f"proposed={review.changes_count} "
-            f"applied={apply_summary['applied_count']} "
-            f"rejected={apply_summary['rejected_count']} "
-            f"lines_phase2={apply_summary['lines_phase2_count']}"
+            f"razonamientos={review.changes_count} "
+            f"lines_phase2={len(phase_2_line_indices)}"
         )
         logger.info(
             "decision: %s → persisting",
@@ -293,10 +287,8 @@ class AlbaranE2EWorkflow:
                 "review_status": review.review_status,
                 "review_provider": review.provider_used,
                 "review_mode": mode_label,
-                "changes_proposed": review.changes_count,
-                "changes_applied": apply_summary["applied_count"],
-                "changes_rejected": apply_summary["rejected_count"],
-                "lines_phase2_count": apply_summary["lines_phase2_count"],
+                "changes_count": review.changes_count,
+                "lines_phase2_count": len(phase_2_line_indices),
             },
             decision_log=decision,
         )
