@@ -17,6 +17,9 @@ class WorkflowRunOrm(Base):
     parent_workflow_id: Mapped[str | None] = mapped_column(String(36))
     document_id: Mapped[str | None] = mapped_column(String(36), index=True)
     current_state: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    attachment_sha256: Mapped[str | None] = mapped_column(
+        String(64), index=True
+    )
     correlation_key: Mapped[str] = mapped_column(
         String(255),
         nullable=False,

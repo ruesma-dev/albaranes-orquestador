@@ -36,6 +36,13 @@ class WorkflowRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def find_latest_by_attachment_sha256(
+        self, attachment_sha256: str
+    ) -> WorkflowRun | None:
+        """Ultimo run NO fallido con esa huella de PDF (o None)."""
+        ...
+
+    @abstractmethod
     def find_active_by_document_id(self, document_id: str) -> WorkflowRun | None:
         """Busca el último workflow asociado al document_id que esté activo,
         en estado pasivo o terminal-failed (NO devuelve approved/duplicate)."""

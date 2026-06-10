@@ -105,6 +105,9 @@ class WorkflowRun:
     updated_at_utc: str
     parent_workflow_id: str | None = None
     document_id: str | None = None
+    # Huella del PDF completo (sha-256). Permite dedup por CONTENIDO
+    # (mismo PDF reenviado en otro correo) antes de gastar IA.
+    attachment_sha256: str | None = None
     completed_at_utc: str | None = None
     last_error: str | None = None
     retry_count: int = 0

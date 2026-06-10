@@ -70,6 +70,7 @@ class WorkflowEngine:
         document_id: str | None = None,
         parent_workflow_id: str | None = None,
         initial_state: WorkflowState = WorkflowState.EMAIL_RECEIVED,
+        attachment_sha256: str | None = None,
     ) -> WorkflowRun:
         now = _utc_iso()
         run = WorkflowRun(
@@ -82,6 +83,7 @@ class WorkflowEngine:
             updated_at_utc=now,
             parent_workflow_id=parent_workflow_id,
             document_id=document_id,
+            attachment_sha256=attachment_sha256,
         )
         self._repo.insert(run)
         logger.info(

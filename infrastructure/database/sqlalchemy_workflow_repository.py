@@ -9,6 +9,7 @@ from sqlalchemy import and_, select, text
 from sqlalchemy.orm import Session
 
 from domain.models.workflow import (
+    FAILED_STATES,
     StepHistoryEntry,
     WorkflowRun,
     WorkflowState,
@@ -102,6 +103,8 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
             "CREATE INDEX IF NOT EXISTS ix_workflow_runs_doc      ON workflow_runs (document_id)",
             "CREATE INDEX IF NOT EXISTS ix_workflow_runs_kind     ON workflow_runs (kind)",
             "CREATE INDEX IF NOT EXISTS ix_workflow_runs_started  ON workflow_runs (started_at_utc DESC)",
+            "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS attachment_sha256 VARCHAR(64)",
+            "CREATE INDEX IF NOT EXISTS ix_workflow_runs_attach   ON workflow_runs (attachment_sha256)",
             """
             CREATE TABLE IF NOT EXISTS workflow_step_history (
                 id                   SERIAL PRIMARY KEY,
@@ -149,6 +152,26 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
                 select(WorkflowRunOrm).where(
                     WorkflowRunOrm.correlation_key == correlation_key
                 )
+            ).first()
+            return self._from_orm(orm) if orm is not None else None
+
+    def find_latest_by_attachment_sha256(
+        self, attachment_sha256: str
+    ) -> WorkflowRun | None:
+        """Ultimo run con esa huella de PDF cuyo estado NO sea fallido.
+        Si solo hay runs fallidos (o ninguno), devuelve None -> se permite
+        reprocesar. Los FAILED_STATES se excluyen de la consulta."""
+        failed = {s.value for s in FAILED_STATES}
+        with self._sf.create_session() as session:
+            orm = session.scalars(
+                select(WorkflowRunOrm)
+                .where(
+                    and_(
+                        WorkflowRunOrm.attachment_sha256 == attachment_sha256,
+                        WorkflowRunOrm.current_state.notin_(failed),
+                    )
+                )
+                .order_by(WorkflowRunOrm.started_at_utc.desc())
             ).first()
             return self._from_orm(orm) if orm is not None else None
 
@@ -271,6 +294,7 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
             kind=run.kind,
             parent_workflow_id=run.parent_workflow_id,
             document_id=run.document_id,
+            attachment_sha256=run.attachment_sha256,
             current_state=run.current_state.value,
             correlation_key=run.correlation_key,
             payload_json=json.dumps(run.payload, ensure_ascii=False),
@@ -310,6 +334,7 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
             kind=orm.kind,  # type: ignore[arg-type]
             parent_workflow_id=orm.parent_workflow_id,
             document_id=orm.document_id,
+            attachment_sha256=getattr(orm, "attachment_sha256", None),
             current_state=WorkflowState(orm.current_state),
             correlation_key=orm.correlation_key,
             payload=json.loads(orm.payload_json) if orm.payload_json else {},

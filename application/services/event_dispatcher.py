@@ -67,6 +67,29 @@ class EventDispatcher:
         """Devuelve el ack y el workflow_id a ejecutar (None si duplicado
         o ya terminal). El caller (API) lanza el BackgroundTask con el id."""
         correlation_key = event.correlation_key
+
+        # Gate 1 (contenido): mismo PDF (attachment_sha256) ya procesado,
+        # aunque venga en otro correo (otra correlation_key). Cancela aqui,
+        # ANTES de crear el workflow -> no se gasta IA (sv2) ni contrato
+        # (sv3) ni valoracion (sv5/sv6). Si solo hubo intentos fallidos, el
+        # guard devuelve None y se reprocesa.
+        dup_content = self._guard.check_attachment(event.attachment_sha256)
+        if dup_content is not None:
+            return (
+                EmailReceivedAck(
+                    accepted=True,
+                    workflow_id=dup_content.id,
+                    correlation_key=correlation_key,
+                    duplicate=True,
+                    message=(
+                        "PDF ya procesado (mismo contenido) en estado="
+                        f"{dup_content.current_state.value}; no se reprocesa"
+                    ),
+                ),
+                None,
+            )
+
+        # Gate 2 (mismo correo): correlation_key exacta ya vista.
         existing = self._guard.check_correlation(correlation_key)
         if existing is not None:
             return (
@@ -89,6 +112,7 @@ class EventDispatcher:
             kind="albaran_e2e",
             correlation_key=correlation_key,
             payload=payload,
+            attachment_sha256=event.attachment_sha256,
         )
 
         return (
