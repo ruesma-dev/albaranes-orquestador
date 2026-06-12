@@ -45,6 +45,15 @@ class WorkflowState(str, Enum):
     PERSISTENCE_FAILED = "persistence_failed"
     VALUATION_FAILED = "valuation_failed"
 
+    # Terminal administrativo (jun 2026): el documento asociado fue
+    # PURGADO (hard-delete) desde el portal sv4. El workflow se
+    # conserva como auditoría pero:
+    #   - NO cuenta para el dedup por attachment_sha256 (Gate 1) ni
+    #     por correlation_key — el mismo PDF puede reprocesarse.
+    #   - NO lo retoma el FailedWorkflowRetrier (no está en
+    #     RETRY_TARGET_STATE).
+    PURGED = "purged"
+
 
 # Estados que pueden retomarse automáticamente al arrancar (proceso
 # reiniciado mientras el workflow estaba activo) o tras un *_failed
@@ -77,7 +86,13 @@ FAILED_STATES = frozenset({
     WorkflowState.VALUATION_FAILED,
 })
 
-TERMINAL_STATES = TERMINAL_OK_STATES | FAILED_STATES
+# Estados administrativos terminales que NO bloquean el dedup ni se
+# reintentan (documento purgado desde sv4).
+PURGED_STATES = frozenset({
+    WorkflowState.PURGED,
+})
+
+TERMINAL_STATES = TERMINAL_OK_STATES | FAILED_STATES | PURGED_STATES
 
 
 # Mapa de qué estado activo retoma el retrier dado un estado fallido.

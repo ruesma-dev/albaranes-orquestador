@@ -56,6 +56,66 @@ def extract_documento_revisado(
     return doc
 
 
+def apply_sigrid_grounding_overrides(
+    *,
+    documento: Dict[str, Any],
+    grounding,
+) -> List[str]:
+    """Aplica DETERMINISTICAMENTE las partes validadas del grounding.
+
+    Cinturón y tirantes sobre la fase 2: aunque el prompt le pide a la
+    IA que respete los datos validados por CIF/código contra Sigrid, no
+    podemos depender de que obedezca. Aquí, DESPUÉS de la fase 2 y
+    ANTES de mandar a sv3, sobrescribimos la cabecera con los valores
+    canónicos del ERP cuando el grounding los validó:
+
+      - proveedor validado por CIF  → cabecera.proveedor_cif (CIF
+        normalizado del ERP) y cabecera.proveedor_nombre (``prv.raz``).
+      - obra validada por código    → cabecera.obra_codigo,
+        cabecera.obra_nombre y cabecera.obra_direccion canónicos.
+
+    Muta ``documento`` in place y devuelve la lista de campos
+    sobrescritos (para log/auditoría). Tolerante a esquema: si no hay
+    ``cabecera`` dict, no hace nada.
+
+    ``grounding`` es un HeaderGroundingResult (no se importa el tipo
+    para no acoplar utils ↔ ports; se accede por atributos).
+    """
+    overridden: List[str] = []
+    if grounding is None or not isinstance(documento, dict):
+        return overridden
+    cabecera = documento.get("cabecera")
+    if not isinstance(cabecera, dict):
+        return overridden
+
+    def _set(field: str, value: Any) -> None:
+        if value is None:
+            return
+        old = cabecera.get(field)
+        if old != value:
+            cabecera[field] = value
+            overridden.append(field)
+
+    if getattr(grounding, "proveedor_validado", False):
+        _set("proveedor_cif", getattr(grounding, "proveedor_cif", None))
+        _set(
+            "proveedor_nombre",
+            getattr(grounding, "proveedor_nombre_canonico", None),
+        )
+
+    if getattr(grounding, "obra_validada", False):
+        _set("obra_codigo", getattr(grounding, "obra_codigo", None))
+        _set("obra_nombre", getattr(grounding, "obra_nombre", None))
+        _set("obra_direccion", getattr(grounding, "obra_direccion", None))
+
+    if overridden:
+        logger.info(
+            "[grounding] cabecera sobrescrita con canónicos Sigrid: %s",
+            ", ".join(overridden),
+        )
+    return overridden
+
+
 def compute_phase2_line_indices(
     *,
     data_phase_1: Dict[str, Any],

@@ -110,6 +110,27 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------ #
+    # Grounding Sigrid para la fase 2 (jun 2026).
+    #
+    # Antes de llamar a sv2 fase 2, el sv7 pide a sv3 una validación
+    # determinista de la cabecera de fase 1 (CIF exacto → proveedor;
+    # código → obra) + listas de candidatos para lo no validado. El
+    # resultado viaja al prompt de fase 2 y lo validado se aplica
+    # determinista sobre el documento revisado.
+    #
+    # GROUNDING_ENABLED=false lo desactiva por completo (fase 2 igual
+    # que antes). Timeout corto e independiente: es una consulta SQL
+    # ligera vía sigrid-api, no debe frenar el pipeline si Sigrid
+    # está lento.
+    # ------------------------------------------------------------ #
+    grounding_enabled: bool = Field(True, alias="GROUNDING_ENABLED")
+    sv3_path_header_grounding: str = Field(
+        "/v1/sigrid/header-grounding",
+        alias="SV3_PATH_HEADER_GROUNDING",
+    )
+    grounding_timeout_s: float = Field(30.0, alias="GROUNDING_TIMEOUT_S")
+
+    # ------------------------------------------------------------ #
     # sv6 — valuation.
     # ------------------------------------------------------------ #
     sv6_base_url: str = Field("http://127.0.0.1:8003", alias="SV6_BASE_URL")

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from domain.models.workflow import (
     FAILED_STATES,
+    PURGED_STATES,
     StepHistoryEntry,
     WorkflowRun,
     WorkflowState,
@@ -158,17 +159,18 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
     def find_latest_by_attachment_sha256(
         self, attachment_sha256: str
     ) -> WorkflowRun | None:
-        """Ultimo run con esa huella de PDF cuyo estado NO sea fallido.
-        Si solo hay runs fallidos (o ninguno), devuelve None -> se permite
-        reprocesar. Los FAILED_STATES se excluyen de la consulta."""
-        failed = {s.value for s in FAILED_STATES}
+        """Ultimo run con esa huella de PDF cuyo estado NO sea fallido
+        NI purgado. Si solo hay runs fallidos/purgados (o ninguno),
+        devuelve None -> se permite reprocesar. FAILED_STATES y
+        PURGED_STATES se excluyen de la consulta."""
+        excluded = {s.value for s in FAILED_STATES | PURGED_STATES}
         with self._sf.create_session() as session:
             orm = session.scalars(
                 select(WorkflowRunOrm)
                 .where(
                     and_(
                         WorkflowRunOrm.attachment_sha256 == attachment_sha256,
-                        WorkflowRunOrm.current_state.notin_(failed),
+                        WorkflowRunOrm.current_state.notin_(excluded),
                     )
                 )
                 .order_by(WorkflowRunOrm.started_at_utc.desc())
@@ -179,6 +181,7 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
         excluded = {
             WorkflowState.APPROVED.value,
             WorkflowState.COMPLETED_DUPLICATE.value,
+            WorkflowState.PURGED.value,
         }
         with self._sf.create_session() as session:
             orm = session.scalars(
@@ -192,6 +195,31 @@ class SqlAlchemyWorkflowRepository(WorkflowRepository):
                 .order_by(WorkflowRunOrm.started_at_utc.desc())
             ).first()
             return self._from_orm(orm) if orm is not None else None
+
+    def find_all_by_document_id(self, document_id: str) -> list[WorkflowRun]:
+        """TODOS los workflows (cualquier estado) ligados a un documento.
+        Usado por el evento document-purged para marcarlos como purged."""
+        with self._sf.create_session() as session:
+            rows = session.scalars(
+                select(WorkflowRunOrm)
+                .where(WorkflowRunOrm.document_id == document_id)
+                .order_by(WorkflowRunOrm.started_at_utc.asc())
+            ).all()
+            return [self._from_orm(orm) for orm in rows]
+
+    def find_all_by_attachment_sha256(
+        self, attachment_sha256: str
+    ) -> list[WorkflowRun]:
+        """TODOS los workflows (cualquier estado) con esa huella de PDF.
+        Red de seguridad del purge: cubre runs que fallaron ANTES de
+        enlazar document_id (extraction/review/persistence_failed)."""
+        with self._sf.create_session() as session:
+            rows = session.scalars(
+                select(WorkflowRunOrm)
+                .where(WorkflowRunOrm.attachment_sha256 == attachment_sha256)
+                .order_by(WorkflowRunOrm.started_at_utc.asc())
+            ).all()
+            return [self._from_orm(orm) for orm in rows]
 
     def find_latest_by_document_id(self, document_id: str) -> WorkflowRun | None:
         with self._sf.create_session() as session:

@@ -55,6 +55,27 @@ class DocumentApprovedEvent(BaseModel):
     review_notes: Optional[str] = None
 
 
+class DocumentPurgedEvent(BaseModel):
+    """Evento desde sv4 cuando el revisor PURGA (hard-delete) el documento.
+
+    El sv4 ya ha borrado físicamente las filas de BBDD (merge, líneas,
+    contratos, valoración y cruda). Este evento avisa al orquestador
+    para que marque como ``purged`` los workflows asociados; sin esto,
+    el guard de idempotencia (dedup por ``attachment_sha256``) seguiría
+    bloqueando el reprocesado del mismo PDF con "ya procesado".
+
+    ``source_sha256`` es el sha-256 del ARCHIVO del documento purgado
+    (= ``albaran_documents_merge.source_sha256``, la página). Se usa
+    como red de seguridad para purgar también workflows que nunca
+    llegaron a enlazar ``document_id`` (fallaron antes de persistir).
+    """
+
+    document_id: str
+    source_sha256: Optional[str] = None
+    purged_by: Optional[str] = None
+    purged_at_utc: str
+
+
 class EmailReceivedAck(BaseModel):
     """Respuesta del POST /v1/events/email-received."""
 

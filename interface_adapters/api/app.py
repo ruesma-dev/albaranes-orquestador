@@ -33,6 +33,7 @@ from config.settings import Settings
 from domain.models.events import (
     ContractSelectedEvent,
     DocumentApprovedEvent,
+    DocumentPurgedEvent,
     EmailReceivedEvent,
 )
 from domain.models.workflow import (
@@ -40,6 +41,7 @@ from domain.models.workflow import (
     WorkflowState,
 )
 from infrastructure.clients.http_extractor_client import HttpExtractorClient
+from infrastructure.clients.http_grounding_client import HttpGroundingClient
 from infrastructure.clients.http_persister_client import HttpPersisterClient
 from infrastructure.clients.http_reviewer_client import HttpReviewerClient
 from infrastructure.clients.http_schema_ddl_client import HttpSchemaDdlClient
@@ -167,12 +169,36 @@ def build_app(settings: Settings) -> FastAPI:
         retry_policy=retry_policy,
     )
 
+    # Grounding Sigrid (jun 2026) — validación determinista de la
+    # cabecera de fase 1 contra el ERP antes de la IA de fase 2.
+    # Best-effort: si sv3/Sigrid no contestan, la fase 2 corre sin
+    # grounding. Desactivable con GROUNDING_ENABLED=false.
+    grounding_client: HttpGroundingClient | None = None
+    if settings.grounding_enabled:
+        grounding_client = HttpGroundingClient(
+            base_url=settings.sv3_base_url,
+            path_grounding=settings.sv3_path_header_grounding,
+            timeout_s=settings.grounding_timeout_s,
+        )
+        logger.info(
+            "[sv7][wiring] Grounding Sigrid ACTIVO → %s%s (timeout=%ss)",
+            settings.sv3_base_url,
+            settings.sv3_path_header_grounding,
+            settings.grounding_timeout_s,
+        )
+    else:
+        logger.info(
+            "[sv7][wiring] Grounding Sigrid DESACTIVADO "
+            "(GROUNDING_ENABLED=false)."
+        )
+
     workflow = AlbaranE2EWorkflow(
         extractor=extractor_client,
         reviewer=reviewer_client,
         persister=persister_client,
         valuator=valuator_client,
         apply_phase_2_patch=settings.apply_phase_2_patch,
+        grounding=grounding_client,
     )
     existing_resolver = ExistingDocResolver(sf)
 
@@ -315,6 +341,23 @@ def build_app(settings: Settings) -> FastAPI:
             event.approved_by,
         )
         return dispatcher.handle_document_approved(event)
+
+    @app.post("/v1/events/document-purged")
+    async def document_purged(event: DocumentPurgedEvent):
+        """Hard-delete en sv4 → marcar workflows como ``purged``.
+
+        Sin esto, el dedup por ``attachment_sha256`` (Gate 1) seguía
+        bloqueando el reprocesado del mismo PDF tras una purga, con el
+        mensaje "PDF ya procesado" aunque el documento ya no existía
+        en el portal.
+        """
+        logger.info(
+            "POST /v1/events/document-purged doc=%s sha=%s by=%s",
+            event.document_id,
+            (event.source_sha256 or "")[:12],
+            event.purged_by,
+        )
+        return dispatcher.handle_document_purged(event)
 
     @app.get("/v1/workflows/{workflow_id}")
     def get_workflow(workflow_id: str):

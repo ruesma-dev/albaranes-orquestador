@@ -54,6 +54,20 @@ class WorkflowRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def find_all_by_document_id(self, document_id: str) -> list[WorkflowRun]:
+        """TODOS los workflows ligados a un documento (cualquier estado).
+        Usado por el evento document-purged."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def find_all_by_attachment_sha256(
+        self, attachment_sha256: str
+    ) -> list[WorkflowRun]:
+        """TODOS los workflows con esa huella de PDF (cualquier estado).
+        Red de seguridad del purge para runs sin document_id."""
+        raise NotImplementedError
+
+    @abstractmethod
     def list_in_states(
         self,
         states: list[WorkflowState],

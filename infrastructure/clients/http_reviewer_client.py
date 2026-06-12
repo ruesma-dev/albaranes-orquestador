@@ -38,6 +38,7 @@ class HttpReviewerClient(ReviewerClient):
         filename: str,
         content_type: str,
         phase_1_data: dict[str, Any],
+        sigrid_context: dict[str, Any] | None = None,
     ) -> ReviewResult:
         url = f"{self._base_url}{self._path}"
 
@@ -50,6 +51,13 @@ class HttpReviewerClient(ReviewerClient):
                         phase_1_data, ensure_ascii=False
                     ),
                 }
+                # Grounding Sigrid (jun 2026): opcional. sv2 lo inyecta
+                # en el prompt de fase 2. Si no viaja, fase 2 funciona
+                # como siempre.
+                if sigrid_context:
+                    data["sigrid_context_json"] = json.dumps(
+                        sigrid_context, ensure_ascii=False
+                    )
                 with httpx.Client(timeout=self._timeout_s) as client:
                     return client.post(url, files=files, data=data)
 

@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from application.utils.apply_patch_to_envelope import (
+    apply_sigrid_grounding_overrides,
     build_review_metadata,
     compute_phase2_line_indices,
     extract_documento_revisado,
@@ -44,6 +45,7 @@ from domain.models.step_results import (
 )
 from domain.models.workflow import WorkflowRun, WorkflowState
 from domain.ports.extractor_port import ExtractionError, ExtractorClient
+from domain.ports.grounding_port import GroundingClient, HeaderGroundingResult
 from domain.ports.persister_port import PersisterClient, PersistenceError
 from domain.ports.reviewer_port import ReviewerClient, ReviewError
 from domain.ports.valuator_port import ValuationError, ValuatorClient
@@ -83,15 +85,19 @@ class AlbaranE2EWorkflow:
         persister: PersisterClient,
         valuator: ValuatorClient,
         apply_phase_2_patch: bool = True,
+        grounding: GroundingClient | None = None,
     ) -> None:
         self._extractor = extractor
         self._reviewer = reviewer
         self._persister = persister
         self._valuator = valuator
         self._apply_phase_2_patch = apply_phase_2_patch
+        self._grounding = grounding
         logger.info(
-            "[wf] AlbaranE2EWorkflow construido. apply_phase_2_patch=%s",
+            "[wf] AlbaranE2EWorkflow construido. apply_phase_2_patch=%s "
+            "grounding=%s",
             apply_phase_2_patch,
+            "ACTIVO" if grounding is not None else "INACTIVO",
         )
 
     # ----------------------------------------------------------- #
@@ -186,9 +192,45 @@ class AlbaranE2EWorkflow:
             )
         phase_1_data = envelope_phase_1.get("data") or {}
 
+        # ------------------------------------------------------------- #
+        # GROUNDING SIGRID (jun 2026) — ANTES de la IA de fase 2.
+        #
+        # Validación determinista de la cabecera de fase 1 contra el ERP:
+        #   1. Proveedor por CIF exacto. Si valida → la IA NO debe tocar
+        #      proveedor_cif/nombre; recibirá el nombre canónico.
+        #   2. Obra por código exacto. Si valida → ídem con
+        #      obra_codigo/nombre/direccion.
+        #   3. Lo NO validado va a la IA CON candidatos de Sigrid (lista
+        #      de obras activas; proveedores con contrato en la obra) para
+        #      que case el texto leído (p.ej. "maco tran S.L." con CIF
+        #      bien) con la entidad real del ERP.
+        #
+        # Best-effort: si sv3/Sigrid no responden, grounding=None y la
+        # fase 2 corre exactamente como antes.
+        # ------------------------------------------------------------- #
+        grounding: HeaderGroundingResult | None = None
+        if self._grounding is not None:
+            cabecera_f1 = (
+                phase_1_data.get("cabecera")
+                if isinstance(phase_1_data, dict)
+                else None
+            ) or {}
+            grounding = self._grounding.ground_header(
+                proveedor_cif=cabecera_f1.get("proveedor_cif"),
+                proveedor_nombre=cabecera_f1.get("proveedor_nombre"),
+                obra_codigo=cabecera_f1.get("obra_codigo"),
+                obra_nombre=cabecera_f1.get("obra_nombre"),
+                obra_direccion=cabecera_f1.get("obra_direccion"),
+            )
+
         logger.info(
-            "→ POST sv2 /v1/albaranes/extract/phase-2 file=%s",
+            "→ POST sv2 /v1/albaranes/extract/phase-2 file=%s grounding=%s",
             filename,
+            (
+                f"prov={grounding.proveedor_status}/obra={grounding.obra_status}"
+                if grounding is not None
+                else "n/a"
+            ),
             extra={"workflow_id": run.id},
         )
         try:
@@ -197,6 +239,9 @@ class AlbaranE2EWorkflow:
                 filename=filename,
                 content_type=content_type,
                 phase_1_data=phase_1_data,
+                sigrid_context=(
+                    grounding.raw if grounding is not None else None
+                ),
             )
         except ReviewError as exc:
             logger.error(
@@ -232,6 +277,14 @@ class AlbaranE2EWorkflow:
         if self._apply_phase_2_patch:
             # Modo merge: el documento revisado SUSTITUYE al de fase 1.
             data_for_sv3 = documento_revisado
+            # Grounding (jun 2026): lo VALIDADO por CIF/código se aplica
+            # determinista sobre la cabecera revisada — aunque la IA
+            # hubiera ignorado la instrucción, a sv3 llegan los datos
+            # canónicos de Sigrid.
+            overridden_fields = apply_sigrid_grounding_overrides(
+                documento=data_for_sv3,
+                grounding=grounding,
+            )
             phase_2_line_indices = compute_phase2_line_indices(
                 data_phase_1=phase_1_data,
                 data_revised=documento_revisado,
@@ -240,8 +293,14 @@ class AlbaranE2EWorkflow:
         else:
             # Modo shadow: NO aplicamos los cambios, mandamos fase 1.
             # Pero los razonamientos de fase 2 viajan en metadata para
-            # auditoría.
+            # auditoría. El grounding validado SÍ se aplica también en
+            # shadow: es determinista (no IA) y corrige la cabecera con
+            # la fuente de verdad del ERP.
             data_for_sv3 = phase_1_data
+            overridden_fields = apply_sigrid_grounding_overrides(
+                documento=data_for_sv3,
+                grounding=grounding,
+            )
             phase_2_line_indices = []
             mode_label = "shadow"
 
@@ -273,7 +332,8 @@ class AlbaranE2EWorkflow:
         decision = (
             f"phase_2 status={review.review_status} mode={mode_label} "
             f"razonamientos={review.changes_count} "
-            f"lines_phase2={len(phase_2_line_indices)}"
+            f"lines_phase2={len(phase_2_line_indices)} "
+            f"grounding_overrides={len(overridden_fields)}"
         )
         logger.info(
             "decision: %s → persisting",

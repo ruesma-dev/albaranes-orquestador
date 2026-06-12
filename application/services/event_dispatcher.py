@@ -23,6 +23,7 @@ from application.services.workflow_engine import WorkflowEngine
 from domain.models.events import (
     ContractSelectedEvent,
     DocumentApprovedEvent,
+    DocumentPurgedEvent,
     EmailReceivedEvent,
     EmailReceivedAck,
     EventApplyResult,
@@ -189,32 +190,34 @@ class EventDispatcher:
                 run.id,
             )
 
-        # Caso 3: estado activo o waiting_approval → encolar evento.
-        # Cuando llegue a un estado donde tenga sentido aplicarlo, se
-        # consumirá. (En esta primera versión, solo es relevante cuando
-        # estaba en awaiting_approval — significa que el revisor cambia
-        # el contrato sin aprobar todavía.)
+        # Caso 3: estado de espera de aprobación → el revisor cambia el
+        # contrato sin aprobar todavía. Spawn revaluation (decisión A).
         if run.current_state == WorkflowState.AWAITING_APPROVAL:
             return self._spawn_revaluation(run, event)
 
-        # En cualquier otro estado activo: dejamos pendiente. Tras
-        # terminar la transición actual, si llega a un estado relevante
-        # se aplicará. (Por ahora lo guardamos como pending_event_json.)
-        run.pending_event = {
-            "type": "contract-selected",
-            "payload": event.model_dump(),
-        }
-        self._repo.update(run)
-        return (
-            EventApplyResult(
-                workflow_id=run.id,
-                previous_state=prev_state.value,
-                new_state=prev_state.value,
-                action="event_queued",
-                detail=f"evento aplicado al llegar a estado pasivo desde {prev_state.value}",
-            ),
-            None,
+        # Caso 4 (jun 2026): CUALQUIER otro estado (activo en vuelo o
+        # *_failed distinto de valuation_failed).
+        #
+        # ANTES aquí se encolaba el evento en ``pending_event`` "para
+        # consumirlo al llegar a un estado pasivo"... pero NINGÚN código
+        # consumía pending_event jamás: el evento moría en BBDD y la
+        # valoración nunca arrancaba aunque el portal decía "Valoración
+        # encolada" (bug reportado: "dice que lanza valorar pero no lo
+        # hace"). Como el evento viene de sv4 (que LEE el document_id de
+        # BBDD), el documento EXISTE y tiene contrato seleccionado, así
+        # que lo correcto es spawn de un workflow albaran_revaluation
+        # independiente: no toca el run padre (que seguirá su curso o se
+        # quedará fallido para el retrier) y garantiza que la valoración
+        # se ejecuta YA contra el contrato recién elegido. Si el padre
+        # también termina valorando, la última escritura gana
+        # (replace_valuation en sv6) — resultado idéntico y consistente.
+        logger.info(
+            "contract-selected con workflow %s en estado %s → "
+            "spawn revaluation independiente",
+            run.id,
+            run.current_state.value,
         )
+        return self._spawn_revaluation(run, event)
 
     def _spawn_revaluation(
         self,
@@ -307,4 +310,95 @@ class EventDispatcher:
             previous_state=prev_state.value,
             new_state=WorkflowState.APPROVED.value,
             action="transition_applied",
+        )
+
+    # ----------------------------------------------------------- #
+    # document-purged (jun 2026)
+    # ----------------------------------------------------------- #
+    def handle_document_purged(
+        self,
+        event: DocumentPurgedEvent,
+    ) -> EventApplyResult:
+        """Marca como ``purged`` todos los workflows del documento.
+
+        Motivación (bug del hard-delete): el sv4 borraba físicamente el
+        albarán de BBDD, pero los ``workflow_runs`` del sv7 seguían
+        existiendo con estado no-fallido. Al reenviar el MISMO PDF, el
+        guard de idempotencia (Gate 1, dedup por ``attachment_sha256``)
+        encontraba el run antiguo y respondía "PDF ya procesado", aunque
+        el documento ya no existía en el portal. Resultado: albaranes
+        imposibles de reprocesar tras una purga.
+
+        Acción:
+          1. TODOS los runs con ``document_id`` == purgado → estado
+             ``purged`` (incluye approved/duplicate: el documento ya no
+             existe, su workflow no debe bloquear nada).
+          2. Red de seguridad: runs cuyo ``attachment_sha256`` ==
+             ``source_sha256`` del documento y SIN ``document_id``
+             (fallaron antes de persistir) → también ``purged``. Para
+             PDFs de UNA página (caso mayoritario), el sha del adjunto
+             coincide con el sha de la página, así que esto cubre
+             además el caso "el workflow nunca enlazó el documento".
+
+        Limitación documentada: en PDFs multipágina, purgar UNA página
+        no purga los workflows de las páginas hermanas (sus documentos
+        siguen vivos). Si se reenvía el PDF completo, el Gate 1 seguirá
+        bloqueándolo mientras exista alguna página hermana no purgada;
+        purga todas las páginas para reprocesar el adjunto entero.
+        """
+        runs = list(self._repo.find_all_by_document_id(event.document_id))
+
+        sha = (event.source_sha256 or "").strip()
+        if sha:
+            seen_ids = {r.id for r in runs}
+            for extra_run in self._repo.find_all_by_attachment_sha256(sha):
+                if extra_run.id in seen_ids:
+                    continue
+                # Solo la red de seguridad: runs huérfanos (sin doc) o
+                # ligados a ESTE mismo documento.
+                if extra_run.document_id in (None, "", event.document_id):
+                    runs.append(extra_run)
+                    seen_ids.add(extra_run.id)
+
+        if not runs:
+            logger.info(
+                "document-purged doc=%s sin workflows asociados (no-op)",
+                event.document_id,
+            )
+            return EventApplyResult(
+                workflow_id="",
+                previous_state="",
+                new_state="",
+                action="no_op",
+                detail="no existen workflows para ese document_id",
+            )
+
+        now = _utc_iso()
+        purged_count = 0
+        last_run = runs[-1]
+        for run in runs:
+            if run.current_state == WorkflowState.PURGED:
+                continue
+            prev = run.current_state
+            run.current_state = WorkflowState.PURGED
+            run.completed_at_utc = now
+            run.updated_at_utc = now
+            run.pending_event = None
+            run.payload["purged_by"] = event.purged_by
+            run.payload["purged_at_utc"] = event.purged_at_utc
+            self._repo.update(run)
+            purged_count += 1
+            logger.info(
+                "state: %s → purged (event document-purged doc=%s)",
+                prev.value,
+                event.document_id,
+                extra={"workflow_id": run.id},
+            )
+
+        return EventApplyResult(
+            workflow_id=last_run.id,
+            previous_state="",
+            new_state=WorkflowState.PURGED.value,
+            action="transition_applied",
+            detail=f"{purged_count} workflow(s) marcados como purged",
         )
